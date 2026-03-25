@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  api:
+    build: ./api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data        # partage les données local ↔ container
+    env_file: .env
+    depends_on:
+      - etl
+
+  dashboard:
+    build: ./dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+    env_file: .env
+    depends_on:
+      - api
+
+  etl:
+    build: ./api                 # même image que l'API
+    command: python etl/init_duckdb.py
+    volumes:
+      - ./data:/app/data
+    env_file: .env
