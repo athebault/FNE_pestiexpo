@@ -6,7 +6,12 @@ Alimentation des données statiques (mise à jour annuelle) :
 - Calendrier d'épandage
 - Nomenclature RPG
 
-Lancement : python etl/etl_statique.py --annee 2026  --region "Pays de la Loire"
+Lancement : 
+    # Sans details (défaut)
+    uv run python3 etl/etl_statique.py --annee 2026
+
+    # Avec details
+    uv run python3 etl/etl_statique.py --annee 2026 --details
 """
 
 import polars as pl
@@ -26,14 +31,16 @@ COMMUNE_GPKG    = DATA_DIR / f"raw/ADE_4-0_GPKG_WGS84G_FRA-ED2026-02-16.gpkg"
 IFT_CSV         = DATA_DIR / "raw/fre-324510908-adonis-ift-2022-v04112024.csv"
 CALENDRIER_XLSX = DATA_DIR / "raw/calendrier_culture_harmonise.xlsx"
 NOMENCLATURE_XLSX = DATA_DIR / "raw/RPG_nomenclatures.xlsx"
+RPG_GPKG          = DATA_DIR / "raw/RPG_3-0__GPKG_LAMB93_FXX_2024-01-01/RPG_Parcelles.gpkg"
 
 
 # ============================================================
-# 1. COMMUNES + CENTROIDES
+# 1a. COMMUNES + CENTROIDES
 # ============================================================
 def build_communes() -> pl.DataFrame:
     logger.info("Chargement des communes...")
     
+    # Chargement des données
     communes = gpd.read_file(COMMUNE_GPKG, layer="COMMUNE")
     
     # Centroïdes en LAMB93 puis reprojection en WGS84
@@ -41,19 +48,61 @@ def build_communes() -> pl.DataFrame:
     communes["latitude"]  = communes.to_crs(epsg=2154).geometry.centroid.to_crs(epsg=4326).y
     
     # Garder uniquement les colonnes utiles
-    cols = ["INSEE_COM", "NOM", "INSEE_DEP", "INSEE_REG", "longitude", "latitude"]
-    df = pl.from_pandas(
+    cols = [
+        "code_insee", "nom_officiel_en_majuscules", 
+        "code_insee_du_departement", "code_insee_de_la_region", 
+        "longitude", "latitude"]
+    
+    df_commune_admin = pl.from_pandas(
         communes[cols].rename(columns={
-            "INSEE_COM": "code_insee",
-            "NOM":       "nom_commune",
-            "INSEE_DEP": "code_insee_dep",
-            "INSEE_REG": "code_insee_reg",
+            "code_insee": "code_insee",
+            "nom_officiel_en_majuscules": "nom_commune",
+            "code_insee_du_departement": "code_insee_dep",
+            "code_insee_de_la_region": "code_insee_reg",
         })
     )
     
-    logger.info(f"  → {df.shape[0]} communes chargées")
-    return df
+    # 
+    logger.info(f"  → {df_commune_admin.shape[0]} communes chargées")
 
+
+    return df_commune_admin
+
+
+# ============================================================
+# 1b. DESCRIPTION DES COMMUNES
+# ============================================================
+def describe_communes() -> pl.DataFrame:
+    logger.info("Données descriptives sur les communes...")
+
+    # Chargement des données
+    communes = gpd.read_file(COMMUNE_GPKG, layer="COMMUNE")
+    rpg      = gpd.read_file(RPG_GPKG)
+
+    # Jointure spatiale parcelles → communes
+    rpg_avec_admin = gpd.sjoin(
+        rpg,
+        communes,
+        how="left",
+        predicate="within",
+    ) 
+
+    # Agrégation par commune 
+    df_commune_details = (
+        pl.from_pandas(pd.DataFrame(rpg_avec_admin.drop(columns="geometry")))
+        .group_by("nom_officiel_en_majuscules")
+        .agg([
+            pl.col("surf_parc").sum().alias("SAU_tot"),
+            pl.col("id_parcel").n_unique().alias("nb_parc"),
+            pl.col("code_cultu").n_unique().alias("nb_cultures"),
+            pl.col("code_group").n_unique().alias("nb_groupes_culture"),
+        ])
+        .rename({"nom_officiel_en_majuscules": "nom_commune"})
+        .sort("nom_commune")
+    )
+
+    logger.info(f"  → {df_commune_details.shape[0]} communes traitées")
+    return df_commune_details
 
 # ============================================================
 # 2. IFT COMMUNES (ADONIS)
@@ -61,14 +110,16 @@ def build_communes() -> pl.DataFrame:
 def build_ift() -> pl.DataFrame:
     logger.info("Chargement IFT ADONIS...")
 
-    ift = pd.read_csv(IFT_CSV, sep=";")
+    ift = pd.read_csv(IFT_CSV, sep=";", low_memory=False, dtype={"insee_com": str})
 
     # Colonnes utiles
     cols = ["id", "insee_com", "sau", "sau_bio",
+            "p_bio", "p_bc", "p_sau",
+            "c_maj", "c_ift_hbc", "c_ift_h",
             "cod_c_maj", "cod_c_hbc", "cod_c_h",
             "ift_t", "ift_t_hbc", "ift_h",
             "ift_t_hh", "ift_hh_hbc", "iftbc",
-            "p_bio", "p_bc", "p_sau"]
+            ]
     
     ift = ift[cols].copy()
 
@@ -76,12 +127,12 @@ def build_ift() -> pl.DataFrame:
     nomenclature = pl.read_excel(NOMENCLATURE_XLSX, sheet_name="Annexe_A_cultures")
     code_to_libelle = dict(zip(
         nomenclature["code_culture"].to_list(),
-        nomenclature["libelle_culture"].to_list()
+        nomenclature["libelle_culture"].to_list(),
     ))
 
-    ift["c_maj"]     = ift["cod_c_maj"].map(code_to_libelle)
-    ift["c_ift_hbc"] = ift["cod_c_hbc"].map(code_to_libelle)
-    ift["c_ift_h"]   = ift["cod_c_h"].map(code_to_libelle)
+    ift["c_maj_depuis_code"]     = ift["cod_c_maj"].map(code_to_libelle)
+    ift["c_ift_hbc_depuis_code"] = ift["cod_c_hbc"].map(code_to_libelle)
+    ift["c_ift_h_depuis_code"]   = ift["cod_c_h"].map(code_to_libelle)
 
     # Code département depuis code_insee
     ift["code_insee_dep"] = ift["insee_com"].str[:2]
@@ -109,9 +160,9 @@ def build_calendrier(annee: int = 2025) -> pl.DataFrame:
     # Forcer l'année
     cal = cal.with_columns([
         pl.date(annee, pl.col("Début de période").dt.month(), pl.col("Début de période").dt.day())
-          .alias("Début de période"),
+          .alias("Debut_de_periode"),
         pl.date(annee, pl.col("Fin de période").dt.month(), pl.col("Fin de période").dt.day())
-          .alias("Fin de période"),
+          .alias("Fin_de_periode"),
     ])
 
     logger.info(f"  → {cal.shape[0]} périodes chargées")
@@ -135,13 +186,20 @@ def build_nomenclature() -> dict[str, pl.DataFrame]:
 # ============================================================
 # 5. SAUVEGARDE EN PARQUET
 # ============================================================
-def save_all(annee: int = 2025):
+def save_all(annee: int = 2026, details: bool = False):
     PARQUET_DIR.mkdir(parents=True, exist_ok=True)
 
     # Communes
     communes = build_communes()
-    communes.write_parquet(PARQUET_DIR / "communes.parquet")
-    logger.info(f"✓ communes.parquet")
+    communes.write_parquet(PARQUET_DIR / "communes_admin.parquet")
+    logger.info(f"✓ communes_admin.parquet")
+
+    if details == True:
+        communes_details = describe_communes()
+        communes_details.write_parquet(PARQUET_DIR / "communes_details.parquet")
+        logger.info(f"✓ communes_details.parquet")
+    else: 
+        logger.info(f"✓ Pas de calcul détaillé sur les communes")
 
     # IFT
     ift = build_ift()
@@ -177,5 +235,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--annee", type=int, default=2026)
+    parser.add_argument("--details", action="store_true", default=False,
+                    help="Calculer les détails par commune (très lent)")
     args = parser.parse_args()
-    save_all(annee=args.annee)
+    save_all(annee=args.annee, details=args.details)

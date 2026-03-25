@@ -14,7 +14,7 @@ PLUIE_SEUIL     = float(os.getenv("PLUIE_SEUIL", 0))
 # API météo
 METEO_URL_ARCHIVES  = "https://archive-api.open-meteo.com/v1/archive"
 METEO_URL_PREVISIONS = "https://api.open-meteo.com/v1/meteofrance"
-METEO_CHUNK_SIZE    = int(os.getenv("METEO_CHUNK_SIZE", 1000))  # Contrainte liée à l'API de MétéoFrance
+METEO_CHUNK_SIZE    = int(os.getenv("METEO_CHUNK_SIZE", 100))  # Contrainte liée à l'API de MétéoFrance
 DAILY_VARIABLES     = [
     "temperature_2m_max",
     "temperature_2m_min", 
