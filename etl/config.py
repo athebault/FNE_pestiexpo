@@ -1,10 +1,13 @@
 import os
 from pathlib import Path
 
-DATA_DIR        = Path(os.getenv("DATA_DIR", "./data"))
+DATA_DIR        = Path(os.getenv("DATA_DIR", "./data")).resolve()
 PARQUET_DIR     = DATA_DIR / "parquet"
 METEO_DIR       = DATA_DIR / "meteo"
 DUCKDB_PATH     = DATA_DIR / "pestiexpo.duckdb"
+
+# Activation de la logique météo (optionnelle)
+METEO_ENABLED = os.getenv("METEO_ENABLED", "False").strip().lower() in ("1", "true", "yes", "y")
 
 # Seuils météo pour le phénomène de dispersion
 VENT_MAX        = int(os.getenv("VENT_MAX", 11))
@@ -20,12 +23,17 @@ DAILY_VARIABLES     = [
     "temperature_2m_min", 
     "precipitation_sum",
     "wind_speed_10m_max",
+    "surface_pressure", 
     "et0_fao_evapotranspiration"
 ]
 HOURLY_VARIABLES    = [
     "temperature_2m", "precipitation",
-    "wind_speed_10m", "et0_fao_evapotranspiration"
+    "wind_speed_10m", "et0_fao_evapotranspiration",
+    "surface_pressure"
 ]
+
+# Fichier source des mesures pesticides
+MESURES_PESTICIDES_FILE = DATA_DIR / "raw/pesticides_2002_2023_v07_2025.xlsx"
 
 # Codes région pour récupération des données parcelllaires RPG
 code_region_rpg = {

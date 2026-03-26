@@ -1,29 +1,28 @@
 """
-ETL Météo Historique - PestiExpo
-Récupère les archives météo pour toutes les communes (ou une région)
+ETL Météo Prévisions - PestiExpo
+Récupère les prévisions météo (7 jours) pour toutes les communes
 et calcule les indicateurs de risque pesticides.
 
 Lancement:
-    # Indicateurs uniquement (léger) — toutes régions
-    uv run python3 etl/etl_meteo_historique.py --annee 2026
-
-    # Indicateurs + données brutes journalières
-    uv run python3 etl/etl_meteo_historique.py --annee 2026 --save_brut
+    # Toutes régions
+    uv run python3 etl/etl_meteo_previsions.py
 
     # Filtrer sur une région
-    uv run python3 etl/etl_meteo_historique.py --annee 2026 --region "Pays de la Loire"
+    uv run python3 etl/etl_meteo_previsions.py --region "Pays de la Loire"
+
+    # Avec données brutes
+    uv run python3 etl/etl_meteo_previsions.py --save_brut
 """
 
 import polars as pl
 import logging
 
-from pathlib import Path
 from datetime import datetime
 
 from config import (
     PARQUET_DIR, METEO_DIR, METEO_ENABLED,
     VENT_MAX, VENT_DISPERSION, PLUIE_SEUIL,
-    METEO_URL_ARCHIVES, DAILY_VARIABLES,
+    METEO_URL_PREVISIONS, DAILY_VARIABLES,
     code_region_rpg
 )
 from utils import fetch_all_communes
@@ -31,50 +30,40 @@ from utils import fetch_all_communes
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+NB_JOURS_FORECAST = 7  # max 16 avec Open-Meteo
+
 
 # ============================================================
 # 1. CALCUL DES INDICATEURS
 # ============================================================
 def compute_indicateurs(meteo: pl.DataFrame) -> pl.DataFrame:
     """Calcule les indicateurs de risque à partir des données météo brutes."""
-
-    meteo = meteo.with_columns([
-        # Interdiction de pulvérisation (vent trop fort)
+    return meteo.with_columns([
         (pl.col("wind_speed_10m_max") >= VENT_MAX).alias("interdiction_pulv"),
-
-        # Pluie limitant la dispersion
         (pl.col("precipitation_sum") >= PLUIE_SEUIL).alias("pluie_limitant_dispersion"),
-
-        # Risque de dispersion (vent dans la zone à risque)
         (
             (pl.col("wind_speed_10m_max") >= VENT_DISPERSION) &
             (pl.col("wind_speed_10m_max") <  VENT_MAX)
         ).alias("risque_dispersion"),
     ])
 
-    return meteo
-
 
 def aggregate_indicateurs(meteo: pl.DataFrame) -> pl.DataFrame:
-    """Agrège les indicateurs par commune sur toute la période."""
-
+    """Agrège les indicateurs par commune sur toute la période prévisionnelle."""
     return (
         meteo.group_by("code_insee")
         .agg([
-            # Indicateurs de risque (nb jours)
             pl.col("interdiction_pulv").sum().alias("nb_jours_interdiction"),
             pl.col("pluie_limitant_dispersion").sum().alias("nb_jours_pluie_limitante"),
             pl.col("risque_dispersion").sum().alias("nb_jours_dispersion"),
-
-            # Statistiques météo brutes
             pl.col("wind_speed_10m_max").mean().alias("vent_moyen"),
             pl.col("wind_speed_10m_max").max().alias("vent_max_obs"),
             pl.col("precipitation_sum").sum().alias("precip_totale"),
             pl.col("temperature_2m_max").mean().alias("temp_max_moyenne"),
             pl.col("temperature_2m_min").mean().alias("temp_min_moyenne"),
             pl.col("et0_fao_evapotranspiration").sum().alias("eto_total"),
-
-            # Nb jours observés
+            pl.col("time").min().alias("date_debut_prevision"),
+            pl.col("time").max().alias("date_fin_prevision"),
             pl.len().alias("nb_jours_obs"),
         ])
         .sort("code_insee")
@@ -83,44 +72,42 @@ def aggregate_indicateurs(meteo: pl.DataFrame) -> pl.DataFrame:
 
 # ============================================================
 # 3. SAUVEGARDE
+# Les prévisions écrasent le fichier précédent (pas d'historique)
 # ============================================================
-def save_meteo(meteo: pl.DataFrame, annee: int, region: str | None = None):
-    """Sauvegarde les données météo brutes partitionnées par année."""
+def save_previsions(meteo: pl.DataFrame, region: str | None = None):
+    """Sauvegarde les données météo prévisionnelles brutes."""
     suffix = f"_{region.replace(' ', '_')}" if region else ""
-    path = METEO_DIR / f"historique/annee={annee}"
+    path = METEO_DIR / "previsions"
     path.mkdir(parents=True, exist_ok=True)
-    meteo.write_parquet(path / f"meteo{suffix}.parquet")
-    logger.info(f"✓ Météo brute sauvegardée : {path}")
+    meteo.write_parquet(path / f"meteo_previsions{suffix}.parquet")
+    logger.info(f"✓ Prévisions brutes sauvegardées : {path}")
 
 
-def save_indicateurs(indicateurs: pl.DataFrame, annee: int, region: str | None = None):
-    """Sauvegarde les indicateurs agrégés dans data/parquet/."""
+def save_indicateurs_previsions(indicateurs: pl.DataFrame, region: str | None = None):
+    """Sauvegarde les indicateurs prévisionnels dans data/parquet/ — écrase à chaque run."""
     suffix = f"_{region.replace(' ', '_')}" if region else ""
     PARQUET_DIR.mkdir(parents=True, exist_ok=True)
-    out = PARQUET_DIR / f"indicateurs_meteo_{annee}{suffix}.parquet"
+    out = PARQUET_DIR / f"indicateurs_previsions{suffix}.parquet"
     indicateurs.write_parquet(out)
-    logger.info(f"✓ Indicateurs sauvegardés : {out} ({indicateurs.shape[0]} communes)")
+    logger.info(f"✓ Indicateurs prévisionnels sauvegardés : {out} ({indicateurs.shape[0]} communes)")
+    logger.info(f"  Mise à jour : {datetime.today().strftime('%Y-%m-%d %H:%M')}")
 
 
 # ============================================================
 # 4. PIPELINE PRINCIPAL
 # ============================================================
-def run(annee: int = 2026, save_brut: bool = False, region: str | None = None):
+def run(nb_jours: int = NB_JOURS_FORECAST, save_brut: bool = False, region: str | None = None):
     """
-    Pipeline complet :
-    1. Charger les communes (filtrées par région si précisée)
-    2. Récupérer la météo
+    Pipeline prévisions :
+    1. Charger les communes
+    2. Récupérer les prévisions
     3. Calculer les indicateurs
-    4. Sauvegarder
+    4. Sauvegarder (écrase le précédent)
     """
-    aujourd_hui = datetime.today()
-    start_date  = f"{annee}-01-01"
-    end_date    = aujourd_hui.strftime("%Y-%m-%d") if annee == aujourd_hui.year else f"{annee}-12-31"
-
-    logger.info(f"ETL Météo Historique — {annee} ({start_date} → {end_date})")
+    logger.info(f"ETL Météo Prévisions — {nb_jours} jours ({datetime.today().strftime('%Y-%m-%d %H:%M')})")
 
     if not METEO_ENABLED:
-        logger.info("METEO_ENABLED=False : ETL météo historique ignoré")
+        logger.info("METEO_ENABLED=False : ETL météo prévisions ignoré")
         return pl.DataFrame([])
 
     # 1. Communes
@@ -139,13 +126,12 @@ def run(annee: int = 2026, save_brut: bool = False, region: str | None = None):
     if communes.is_empty():
         raise ValueError(f"Aucune commune trouvée pour la région '{region}'.")
 
-    # 2. Météo brute
-    meteo = fetch_all_communes(communes, METEO_URL_ARCHIVES, {
-        "start_date": start_date,
-        "end_date":   end_date,
-        "daily":      DAILY_VARIABLES,
-        "timezone":   "Europe/Paris",
-    })
+    # 2. Prévisions brutes
+    meteo = fetch_all_communes(communes, METEO_URL_PREVISIONS, {
+        "forecast_days": nb_jours,
+        "daily":         DAILY_VARIABLES,
+        "timezone":      "Europe/Paris",
+    }, label="prévisions")
     logger.info(f"  {meteo.shape[0]} lignes météo récupérées")
 
     # 3. Indicateurs
@@ -154,20 +140,21 @@ def run(annee: int = 2026, save_brut: bool = False, region: str | None = None):
 
     # 4. Sauvegarde
     if save_brut:
-        save_meteo(meteo_avec_indicateurs, annee, region)
-    save_indicateurs(indicateurs, annee, region)
+        save_previsions(meteo_avec_indicateurs, region)
+    save_indicateurs_previsions(indicateurs, region)
 
-    logger.info("ETL Météo Historique terminé ✓")
+    logger.info("ETL Météo Prévisions terminé ✓")
     return indicateurs
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--annee",     type=int,  default=datetime.today().year)
+    parser.add_argument("--nb_jours",  type=int,  default=NB_JOURS_FORECAST,
+                        help="Nombre de jours de prévision (max 16)")
     parser.add_argument("--save_brut", action="store_true",
-                        help="Sauvegarder aussi les données météo brutes journalières")
+                        help="Sauvegarder aussi les données brutes journalières")
     parser.add_argument("--region",    type=str,  default=None,
                         help='Filtrer sur une région (ex: "Pays de la Loire")')
     args = parser.parse_args()
-    run(annee=args.annee, save_brut=args.save_brut, region=args.region)
+    run(nb_jours=args.nb_jours, save_brut=args.save_brut, region=args.region)

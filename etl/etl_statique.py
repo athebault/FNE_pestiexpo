@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # CHEMINS SOURCE 
 # ============================================================
-COMMUNE_GPKG    = DATA_DIR / f"raw/ADE_4-0_GPKG_WGS84G_FRA-ED2026-02-16.gpkg"
+COMMUNE_GPKG    = DATA_DIR / "raw/ADE_4-0_GPKG_WGS84G_FRA-ED2026-02-16.gpkg"
 IFT_CSV         = DATA_DIR / "raw/fre-324510908-adonis-ift-2022-v04112024.csv"
 CALENDRIER_XLSX = DATA_DIR / "raw/calendrier_culture_harmonise.xlsx"
 NOMENCLATURE_XLSX = DATA_DIR / "raw/RPG_nomenclatures.xlsx"
