@@ -4,104 +4,18 @@ Basé sur : cultures majoritaires × calendrier épandage × météo journalièr
 
 Logique :
 - IFT journalier culture = IFT_annuel / nb_periodes_calendrier (culture × département)
-- Risque commune = somme des IFT journaliers des 3 cultures × facteur météo
+- Risque commune = somme des IFT journaliers des 3 cultures × indicateur météo
 - Indicateur final normalisé 0-4 par quartiles sur l'année
 """
 
 import polars as pl
-import duckdb
 import logging
 from datetime import date, timedelta
-from config import DUCKDB_PATH, PARQUET_DIR, VENT_MAX, VENT_DISPERSION, PLUIE_SEUIL, METEO_ENABLED
+from config import *
+from utils import get_duckdb
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-FACTEUR_DISPERSION = 1.5
-
-# ============================================================
-# TABLE DE CORRESPONDANCE  cultures IFT (ADONIS) → calendrier
-# ============================================================
-CULTURE_MAPPING: dict[str, str] = {
-    # Blé
-    "Blé tendre":                                   "Blé tendre",
-    "Blé dur":                                      "Blé dur",
-    # Orge
-    "Orge d'hiver":                                 "Orge d'hiver",
-    "Orge de printemps":                            "Orge de printemps",
-    # Céréales d'hiver secondaires
-    "Triticale":                                    "Céréales d'hiver",
-    "Épeautre":                                     "Céréales d'hiver",
-    "Seigle d'hiver":                               "Céréales d'hiver",
-    # Céréales de printemps / indéterminées
-    "Avoine":                                       "Céréales",
-    "Seigle de printemps":                          "Céréales",
-    "Mélange de céréales":                          "Céréales",
-    # Maïs
-    "Maïs":                                         "Maïs",
-    "Maïs ensilage":                                "Maïs",
-    "Maïs doux":                                    "Maïs",
-    # Oléagineux
-    "Colza":                                        "Colza",
-    "Tournesol":                                    "Tournesol",
-    "Lin fibres":                                   "Lin printemps",
-    "Lin oléagineux":                               "Lin printemps",
-    # Cultures diverses
-    "Sorgho":                                       "Sorgho",
-    "Millet":                                       "Millet",
-    "Sarrasin":                                     "Céréales",
-    "Riz":                                          "Céréales",
-    # Betteraves
-    "Betterave non fourragère / Bette":             "Betterave",
-    # Pommes de terre
-    "Pomme de terre de consommation":               "Pomme de terre de consommation",
-    "Pomme de terre féculière":                     "Pomme de terre de consommation",
-    "Pomme de terre primeur":                       "Pomme de terre de consommation",
-    # Légumineuses
-    "Féverole":                                     "Féverole",
-    "Pois protéagineux":                            "Pois protéagineux",
-    "Petits pois":                                  "Pois de printemps",
-    "Lentille cultivée (non fourragère)":           "Pois de printemps",
-    "Pois chiche":                                  "Pois de printemps",
-    "Mélange de légumineuses":                      "Pois protéagineux",
-    "Mélange de légumineuses fourragères":          "Luzerne",
-    "Mélange de légumineuses fourragères (entre elles)": "Luzerne",
-    "Mélange de protéagineux":                      "Pois protéagineux",
-    "Autre mélange de plantes fixant l'azote":      "Luzerne",
-    # Soja → légumineuse la plus proche agronomiquement
-    "Soja":                                         "Féverole d'hiver",
-    # Lin
-    "Lin d'hiver":                                  "Lin d'hiver",
-    # Luzerne
-    "Luzerne déshydratée":                          "Luzerne",
-    "Autre luzerne":                                "Luzerne",
-    "Autre sainfoin":                               "Luzerne",
-    "Autre trèfle":                                 "Luzerne",
-    # Prairies et surfaces enherbées
-    "Prairie permanente":                           "Prairies",
-    "Prairie en rotation longue (6 ans ou plus)":  "Prairies",
-    "Autre prairie temporaire de 5 ans ou moins":  "Prairies",
-    "Ray-grass de 5 ans ou moins":                 "Prairies",
-    "Surface pastorale (SPH)":                     "Prairies",
-    "Surface pastorale (SPL)":                     "Prairies",
-    "Bois pâturé":                                  "Prairies",
-    # Vigne
-    "Vigne":                                        "Vigne",
-    "Vigne : raisins de cuve":                      "Vigne",
-    # Arboriculture
-    "Vergers":                                      "Arboriculture",
-    "Cerise bigarreau pour transformation":         "Arboriculture",
-    "Prune d'Ente pour transformation":             "Arboriculture",
-    "Noisette":                                     "Arboriculture",
-    "Noix":                                         "Arboriculture",
-    "Châtaigne":                                    "Arboriculture",
-    "Châtaigneraie":                                "Arboriculture",
-    "Agrume":                                       "Arboriculture",
-    "Oliveraie":                                    "Arboriculture",
-    "Petit fruit rouge":                            "Arboriculture",
-    "Fraise":                                       "Arboriculture",
-}
-
 
 def normaliser_culture(expr: pl.Expr) -> pl.Expr:
     """Applique CULTURE_MAPPING sur une expression Polars, retourne None si absent."""
@@ -115,19 +29,29 @@ def normaliser_culture(expr: pl.Expr) -> pl.Expr:
 # ============================================================
 # 1. CHARGEMENT
 # ============================================================
-def load_data(annee: int) -> tuple:
+def load_data(annee: int, region: str | None = None) -> tuple:
 
-    con = duckdb.connect(str(DUCKDB_PATH))
+    if region is not None and region not in code_region_rpg:
+        regions_valides = ", ".join(sorted(code_region_rpg.keys()))
+        raise ValueError(f"Région inconnue : '{region}'. Régions valides : {regions_valides}")
 
-    ift_raw = con.execute("""
+    con = get_duckdb()
+
+    region_filter = ""
+    if region is not None:
+        code_reg = code_region_rpg[region]
+        region_filter = f"AND code_insee_reg = '{code_reg}'"
+        logger.info(f"Filtre région : {region} (code {code_reg})")
+
+    ift_raw = con.execute(f"""
         SELECT
             insee_com,
             code_insee_dep,
-            c_maj,     ift_t_hbc  AS ift_maj,
-            c_ift_hbc, ift_hh_hbc AS ift_hbc,
+            c_maj,     ift_t_hbc  AS ift_maj_hbc,
+            c_ift_hbc, ift_hh_hbc AS ift_hh_hbc,
             c_ift_h,   ift_h      AS ift_h
         FROM ift_communes_enrichi
-        WHERE ift_t IS NOT NULL
+        WHERE ift_t IS NOT NULL {region_filter}
     """).pl()
 
     # Normalisation des noms de culture vers les noms du calendrier
@@ -162,12 +86,14 @@ def load_data(annee: int) -> tuple:
 
     meteo = None
     if not METEO_ENABLED:
-        logger.info("METEO_ENABLED=False : chargement météo ignoré, facteur_meteo=1.0 utilisé par défaut")
+        # Pas de prise en compte de la météo : indicateur_meteo = 1 (conditions normales, pas d'amplification du risque)
+        logger.info("METEO_ENABLED=False : chargement météo ignoré, indicateur_meteo=1 utilisé par défaut")
     else:
         try:
+            # Récupération des données météo permettant le calcul de l'indicateur de dispersion (vent + pluie)
             meteo = pl.read_parquet(
-                PARQUET_DIR.parent / f"meteo/historique/annee={annee}/meteo.parquet"
-            ).select(["code_insee", "time", "wind_speed_10m_max", "precipitation_sum"])
+                METEO_DIR / f"historique/{annee}/meteo.parquet"
+            ).select(["code_insee", "time", "wind_speed_10m_mean", "precipitation_sum"])
         except FileNotFoundError:
             logger.warning("Fichier météo introuvable pour l'année %s -> mode sans météo", annee)
             meteo = None
@@ -188,34 +114,32 @@ def compute_ift_journalier(
     Pour chaque commune et chaque culture (c_maj, c_ift_hbc, c_ift_h) :
     - Vérifie si la date tombe dans une période active
     - IFT journalier = IFT_annuel / nb_periodes_calendrier si actif, sinon 0
-    - Somme les 3 IFT journaliers par commune
+    - Agrège les contributions en évitant le double-comptage :
+        c_ift_hbc et c_ift_h ne sont ajoutés que s'ils diffèrent de c_maj
     """
 
-    resultats = []
     cal_for_join = cal.with_columns([pl.col("departement_code").cast(pl.Utf8)])
+
+    # La date cible est elle sur une période active (i.e de traitement) pour cette culture × département ?
     cal_active = cal_for_join.filter(
         (pl.col("Debut_de_periode") <= date_cible) &
         (pl.col("Fin_de_periode")   >= date_cible)
     )
 
-    # (col_culture_norm, col_ift, filtre_type, col_nb_periodes)
+    # (col_culture_norm, col_ift, filtre_type, col_nb_periodes, suffixe_résultat)
     configs = [
-        ("c_maj_cal",     "ift_maj",  None,                                          "nb_periodes_total"),
-        ("c_ift_hbc_cal", "ift_hbc",  pl.col("Fongicides") | pl.col("Insecticides"), "nb_periodes_fongi_insecti"),
-        ("c_ift_h_cal",   "ift_h",    pl.col("Herbicides"),                          "nb_periodes_herbicides"),
+        ("c_maj_cal",     "ift_maj_hbc", None,                                         "nb_periodes_total",         "maj_hbc"),
+        ("c_ift_hbc_cal", "ift_hh_hbc", pl.col("Fongicides") | pl.col("Insecticides"), "nb_periodes_fongi_insecti", "hh_hbc"),
+        ("c_ift_h_cal",   "ift_h",      pl.col("Herbicides"),                          "nb_periodes_herbicides",    "h"),
     ]
 
-    for col_culture_cal, col_ift, filtre_type, col_nb in configs:
-        # Périodes actives filtrées par type de traitement
-        if filtre_type is not None:
-            cal_active_type = cal_active.filter(filtre_type)
-        else:
-            cal_active_type = cal_active
+    result_dfs = []
+    for col_culture_cal, col_ift, filtre_type, col_nb, suffix in configs:
+        cal_active_type = cal_active.filter(filtre_type) if filtre_type is not None else cal_active
 
         joined = (
             ift.select(["insee_com", "code_insee_dep", col_culture_cal, col_ift])
             .rename({col_culture_cal: "culture", col_ift: "ift_annuel"})
-            # Jointure sur nb_periodes (toutes périodes, pas seulement actives)
             .join(
                 cal_for_join.select(["departement_code", "culture", col_nb])
                    .unique(["departement_code", "culture"]),
@@ -223,61 +147,98 @@ def compute_ift_journalier(
                 right_on=["departement_code", "culture"],
                 how="left"
             )
-            # Jointure sur périodes actives (pour savoir si on est dans une période)
             .join(
                 cal_active_type.select(["departement_code", "culture"])
+                          .unique(["departement_code", "culture"])
                           .with_columns(pl.lit(True).alias("periode_active")),
                 left_on=["code_insee_dep", "culture"],
                 right_on=["departement_code", "culture"],
                 how="left"
             )
-            .with_columns([
-                # IFT journalier = IFT / nb_periodes si période active
-                pl.when(
-                    pl.col("periode_active").is_not_null() &
-                    pl.col(col_nb).is_not_null()
-                )
-                .then(pl.col("ift_annuel") / pl.col(col_nb))
-                .otherwise(0.0)
-                .alias("ift_journalier")
-            ])
-            .select(["insee_com", "ift_journalier"])
+            .with_columns(
+                pl.when(pl.col(col_nb).is_null())
+                  .then(pl.lit(None, dtype=pl.Float64))   # pas de données calendrier → NaN
+                .when(pl.col("periode_active").is_not_null())
+                  .then(pl.col("ift_annuel") / pl.col(col_nb))  # période active
+                .otherwise(pl.lit(0.0))                  # dans le calendrier, hors période active → 0
+                .alias(f"ift_j_{suffix}")
+            )
+            .select(["insee_com", f"ift_j_{suffix}"])
         )
-        resultats.append(joined)
+        result_dfs.append(joined)
 
-    # Somme des 3 IFT journaliers par commune
-    df = (
-        pl.concat(resultats)
-        .group_by("insee_com")
-        .agg(pl.col("ift_journalier").sum().alias("ift_journalier_total"))
+    # Jointure côte à côte des 3 contributions
+    df = result_dfs[0]
+    for rdf in result_dfs[1:]:
+        df = df.join(rdf, on="insee_com", how="left")
+
+    # Flags de déduplication : c_ift_hh_hbc / c_ift_h inclus seulement si culture différente de c_maj
+    # Comparaison sur les noms calendrier (_cal) : deux cultures ADONIS qui mappent vers la même
+    # entrée calendrier sont considérées identiques (même périodes, même référence IFT).
+    dedup = ift.select([
+        "insee_com",
+        (pl.col("c_ift_hbc_cal") != pl.col("c_maj_cal")).fill_null(True).alias("hbc_different"),
+        (pl.col("c_ift_h_cal")   != pl.col("c_maj_cal")).fill_null(True).alias("h_different"),
+    ])
+    df = df.join(dedup, on="insee_com", how="left")
+
+    # Agrégation avec propagation des nulls :
+    # - None si aucune culture contributrice n'a de données calendrier
+    # - sinon somme des contributions (0 si culture exclue par dédup ou hors période)
+    # has_any_data vérifie uniquement les cultures qui contribuent effectivement
+    has_any_data = (
+        pl.col("ift_j_maj_hbc").is_not_null()
+        | (pl.col("hbc_different") & pl.col("ift_j_hh_hbc").is_not_null())
+        | (pl.col("h_different")   & pl.col("ift_j_h").is_not_null())
     )
+
+    df = df.with_columns(
+        pl.when(has_any_data)
+        .then(
+            pl.col("ift_j_maj_hbc").fill_null(0.0)
+            + pl.when(pl.col("hbc_different")).then(pl.col("ift_j_hh_hbc").fill_null(0.0)).otherwise(0.0)
+            + pl.when(pl.col("h_different")).then(pl.col("ift_j_h").fill_null(0.0)).otherwise(0.0)
+        )
+        .otherwise(pl.lit(None, dtype=pl.Float64))
+        .alias("ift_journalier_total")
+    ).select(["insee_com", "ift_journalier_total"])
 
     return df
 
 
 # ============================================================
-# 3. FACTEUR MÉTÉO
+# 3. INDICATEUR MÉTÉO  (0 – 3)
 # ============================================================
-def compute_facteur_meteo(meteo_jour: pl.DataFrame) -> pl.DataFrame:
-    return meteo_jour.with_columns([
-        pl.when(pl.col("wind_speed_10m_max") >= VENT_MAX)
-          .then(0.0)
-        .when(pl.col("precipitation_sum") >= PLUIE_SEUIL)
-          .then(0.0)
-        .when(
-            (pl.col("wind_speed_10m_max") >= VENT_DISPERSION) &
-            (pl.col("wind_speed_10m_max") <  VENT_MAX)
-        )
-          .then(FACTEUR_DISPERSION)
-        .otherwise(1.0)
-        .alias("facteur_meteo"),
+def compute_indicateur_meteo(meteo_jour: pl.DataFrame) -> pl.DataFrame:
+    """
+    Indicateur de conditions météo favorables à la dispersion des pesticides.
 
-        (pl.col("wind_speed_10m_max") >= VENT_MAX).alias("interdiction_pulv"),
-        (pl.col("precipitation_sum")  >= PLUIE_SEUIL).alias("pluie_limitante"),
-        (
-            (pl.col("wind_speed_10m_max") >= VENT_DISPERSION) &
-            (pl.col("wind_speed_10m_max") <  VENT_MAX)
-        ).alias("risque_dispersion"),
+    0 — Pas de dispersion : pluie (> 0 mm) ou vent ≥ VENT_MAX (19 m/s)
+        La pluie empêche l'épandage et lave les dépôts ; le vent fort interdit la pulvérisation.
+    1 — Conditions calmes, faible risque de dérive
+        vent < VENT_DISPERSION_MIN (5 m/s), pas de pluie
+    2 — Dispersion modérée
+        VENT_DISPERSION_MIN (5) ≤ vent < VENT_DISPERSION_SEUIL2 (11 m/s), pas de pluie
+    3 — Forte dispersion
+        VENT_DISPERSION_SEUIL2 (11) ≤ vent < VENT_MAX (19 m/s), pas de pluie
+    """
+    pluie = pl.col("precipitation_sum") > PLUIE_SEUIL   # > 0 mm
+    vent  = pl.col("wind_speed_10m_mean")
+
+    return meteo_jour.with_columns([
+        pl.when(pluie | (vent >= VENT_MAX))
+          .then(pl.lit(0))
+        .when(vent >= VENT_DISPERSION_SEUIL2)
+          .then(pl.lit(3))
+        .when(vent >= VENT_DISPERSION_MIN)
+          .then(pl.lit(2))
+        .otherwise(pl.lit(1))
+        .cast(pl.Int32)
+        .alias("indicateur_meteo"),
+
+        (vent >= VENT_MAX).alias("interdiction_pulv"),
+        (pl.col("precipitation_sum") > PLUIE_SEUIL).alias("pluie_limitante"),
+        (vent >= VENT_DISPERSION_MIN).alias("risque_dispersion"),
     ])
 
 
@@ -299,12 +260,15 @@ def normalize_0_4(df: pl.DataFrame, col: str = "risque_brut") -> pl.DataFrame:
     if valeurs_positives.is_empty():
         logger.info("Aucune valeur de risque brut > 0, normalisation en 0 partout")
         return df.with_columns(pl.lit(0).alias("risque_0_4"))
-
-    q1 = valeurs_positives.quantile(0.25)
-    q2 = valeurs_positives.quantile(0.50)
-    q3 = valeurs_positives.quantile(0.75)
-
-    logger.info(f"Quartiles risque brut — Q1: {q1:.4f} | Q2: {q2:.4f} | Q3: {q3:.4f}")
+    if METHODE_SEUIL == "quartiles":
+        q1 = valeurs_positives.quantile(0.25)
+        q2 = valeurs_positives.quantile(0.50)
+        q3 = valeurs_positives.quantile(0.75)
+        logger.info(f"Quartiles risque brut — Q1: {q1:.4f} | Q2: {q2:.4f} | Q3: {q3:.4f}")
+    else:
+        q1, q2, q3 = VALEURS_SEUIL  # Seuils fixes pour les niveaux de risque
+        logger.info(f"Valeurs seuils risque brut — 1: {q1:.4f} | 2: {q2:.4f} | 3: {q3:.4f}")
+    
 
     return df.with_columns(
         pl.when(pl.col(col) == 0)
@@ -323,9 +287,9 @@ def normalize_0_4(df: pl.DataFrame, col: str = "risque_brut") -> pl.DataFrame:
 # ============================================================
 # 5. PIPELINE PRINCIPAL
 # ============================================================
-def compute_risque_journalier(annee: int) -> pl.DataFrame:
+def compute_risque_journalier(annee: int, region: str | None = None) -> pl.DataFrame:
 
-    ift, cal, meteo = load_data(annee)
+    ift, cal, meteo = load_data(annee, region)
 
     nb_jours = 366 if annee % 4 == 0 else 365
     dates = [date(annee, 1, 1) + timedelta(days=d) for d in range(nb_jours)]
@@ -337,20 +301,22 @@ def compute_risque_journalier(annee: int) -> pl.DataFrame:
 
         ift_jour = compute_ift_journalier(ift, cal, d)
 
-        if METEO_ENABLED and meteo is not None:
-            meteo_jour = (
-                meteo.filter(pl.col("time") == d)
-                .pipe(compute_facteur_meteo)
-            )
+        meteo_jour_raw = meteo.filter(pl.col("time") == d) if (METEO_ENABLED and meteo is not None) else None
+
+        if meteo_jour_raw is not None and not meteo_jour_raw.is_empty():
+            meteo_jour = meteo_jour_raw.pipe(compute_indicateur_meteo)
         else:
+            # Pas de météo ou date hors couverture ERA5 (lag ~5-7j) → indicateur neutre
+            if METEO_ENABLED and meteo is not None and meteo_jour_raw is not None:
+                logger.debug(f"  {d} : hors couverture ERA5, indicateur_meteo=1 (neutre)")
             meteo_jour = (
                 ift_jour.select(pl.col("insee_com").alias("code_insee"))
                 .with_columns([
-                    pl.lit(1.0).alias("facteur_meteo"),
+                    pl.lit(1).cast(pl.Int32).alias("indicateur_meteo"),
                     pl.lit(False).alias("interdiction_pulv"),
                     pl.lit(False).alias("pluie_limitante"),
                     pl.lit(False).alias("risque_dispersion"),
-                    pl.lit(None).cast(pl.Float64).alias("wind_speed_10m_max"),
+                    pl.lit(None).cast(pl.Float64).alias("wind_speed_10m_mean"),
                     pl.lit(None).cast(pl.Float64).alias("precipitation_sum"),
                 ])
             )
@@ -358,16 +324,16 @@ def compute_risque_journalier(annee: int) -> pl.DataFrame:
         risque_jour = (
             ift_jour.join(
                 meteo_jour.select([
-                    "code_insee", "facteur_meteo",
+                    "code_insee", "indicateur_meteo",
                     "interdiction_pulv", "pluie_limitante",
-                    "risque_dispersion", "wind_speed_10m_max", "precipitation_sum"
+                    "risque_dispersion", "wind_speed_10m_mean", "precipitation_sum"
                 ]),
                 left_on="insee_com",
                 right_on="code_insee",
                 how="left"
             )
             .with_columns([
-                (pl.col("ift_journalier_total") * pl.col("facteur_meteo"))
+                (pl.col("ift_journalier_total") * pl.col("indicateur_meteo"))
                   .alias("risque_brut"),
                 pl.lit(d).alias("date"),
             ])
@@ -383,18 +349,188 @@ def compute_risque_journalier(annee: int) -> pl.DataFrame:
 
 
 # ============================================================
-# 6. SAUVEGARDE
+# 6. RISQUE PRÉVISIONNEL (J+7)
 # ============================================================
+def compute_risque_previsions(annee: int, region: str | None = None) -> pl.DataFrame | None:
+    """
+    Calcule l'indicateur de risque pour les jours de prévision météo disponibles (max 7 jours).
+    - IFT et calendrier : identiques au calcul historique
+    - Météo : chargée depuis data/meteo/previsions/meteo_previsions.parquet
+    - Normalisation 0-4 : réutilise les quartiles du risque annuel historique (même échelle)
+    """
+    previsions_path = METEO_DIR / "previsions/meteo_previsions.parquet"
+    if not previsions_path.exists():
+        logger.warning("Prévisions météo non disponibles : %s", previsions_path)
+        return None
+
+    ift, cal, _ = load_data(annee, region)
+
+    meteo_prev = pl.read_parquet(previsions_path).select(
+        ["code_insee", "time", "wind_speed_10m_mean", "precipitation_sum"]
+    )
+    dates_prev = sorted(meteo_prev["time"].unique().to_list())
+    logger.info(f"Risque prévisions — {len(dates_prev)} jours : {dates_prev[0]} → {dates_prev[-1]}")
+
+    resultats = []
+    for d in dates_prev:
+        ift_jour = compute_ift_journalier(ift, cal, d)
+        meteo_jour = (
+            meteo_prev.filter(pl.col("time") == d)
+            .pipe(compute_indicateur_meteo)
+        )
+        risque_jour = (
+            ift_jour.join(
+                meteo_jour.select([
+                    "code_insee", "indicateur_meteo",
+                    "interdiction_pulv", "pluie_limitante",
+                    "risque_dispersion", "wind_speed_10m_mean", "precipitation_sum"
+                ]),
+                left_on="insee_com", right_on="code_insee", how="left"
+            )
+            .with_columns([
+                (pl.col("ift_journalier_total") * pl.col("indicateur_meteo")).alias("risque_brut"),
+                pl.lit(d).alias("date"),
+            ])
+        )
+        resultats.append(risque_jour)
+
+    df_prev = pl.concat(resultats)
+
+    # Normalisation avec les quartiles de l'année historique pour garder la même échelle
+    hist_path = PARQUET_DIR / f"risque_journalier_{annee}.parquet"
+    if hist_path.exists():
+        hist = pl.read_parquet(hist_path)
+        vals_pos = hist.filter(pl.col("risque_brut") > 0)["risque_brut"]
+        if not vals_pos.is_empty():
+            if METHODE_SEUIL == "quartiles":
+                q1 = vals_pos.quantile(0.25)
+                q2 = vals_pos.quantile(0.50)
+                q3 = vals_pos.quantile(0.75)
+            else:
+                q1, q2, q3 = VALEURS_SEUIL
+            df_prev = df_prev.with_columns(
+                pl.when(pl.col("risque_brut").is_null()).then(pl.lit(None, dtype=pl.Int32))
+                .when(pl.col("risque_brut") == 0).then(pl.lit(0, dtype=pl.Int32))
+                .when(pl.col("risque_brut") <= q1).then(pl.lit(1, dtype=pl.Int32))
+                .when(pl.col("risque_brut") <= q2).then(pl.lit(2, dtype=pl.Int32))
+                .when(pl.col("risque_brut") <= q3).then(pl.lit(3, dtype=pl.Int32))
+                .otherwise(pl.lit(4, dtype=pl.Int32))
+                .alias("risque_0_4")
+            )
+        else:
+            df_prev = df_prev.with_columns(pl.lit(None, dtype=pl.Int32).alias("risque_0_4"))
+    else:
+        logger.warning("Risque historique non trouvé — normalisation relative aux prévisions seules")
+        df_prev = normalize_0_4(df_prev, col="risque_brut")
+
+    return df_prev.sort(["insee_com", "date"])
+
+
+# ============================================================
+# 7. SAUVEGARDE DUCKDB
+# ============================================================
+def write_risque_to_duckdb(df: pl.DataFrame, annee: int, region: str | None = None):
+    """
+    Écrit le risque journalier dans la table DuckDB `risque_journalier`.
+    Stratégie : supprime les lignes existantes pour l'année + communes concernées,
+    puis insère les nouvelles (permet les mises à jour partielles par région).
+    """
+    con = get_duckdb()
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS risque_journalier (
+            insee_com            VARCHAR,
+            date                 DATE,
+            ift_journalier_total DOUBLE,
+            indicateur_meteo     INTEGER,
+            interdiction_pulv    BOOLEAN,
+            pluie_limitante      BOOLEAN,
+            risque_dispersion    BOOLEAN,
+            wind_speed_10m_mean   DOUBLE,
+            precipitation_sum    DOUBLE,
+            risque_brut          DOUBLE,
+            risque_0_4           INTEGER,
+            PRIMARY KEY (insee_com, date)
+        )
+    """)
+    communes_str = "', '".join(df["insee_com"].unique().to_list())
+    con.execute(f"""
+        DELETE FROM risque_journalier
+        WHERE year(date) = {annee}
+          AND insee_com IN ('{communes_str}')
+    """)
+    con.execute("""
+        INSERT INTO risque_journalier
+        SELECT insee_com, date, ift_journalier_total, indicateur_meteo,
+               interdiction_pulv, pluie_limitante, risque_dispersion,
+               wind_speed_10m_mean, precipitation_sum, risque_brut, risque_0_4
+        FROM df
+    """)
+    n = df.shape[0]
+    region_label = f" — {region}" if region else ""
+    logger.info(
+        f"✓ DuckDB risque_journalier{region_label} — {n:,} lignes "
+        f"({df['date'].n_unique()} jours × {df['insee_com'].n_unique()} communes)"
+    )
+    con.close()
+
+
+def write_previsions_to_duckdb(df: pl.DataFrame):
+    """
+    Écrit les prévisions dans la table DuckDB `risque_previsions`.
+    La table est entièrement remplacée à chaque run (les prévisions ne sont pas historisées).
+    """
+    con = get_duckdb()
+    con.execute("DROP TABLE IF EXISTS risque_previsions")
+    con.execute("""
+        CREATE TABLE risque_previsions (
+            insee_com            VARCHAR,
+            date                 DATE,
+            ift_journalier_total DOUBLE,
+            indicateur_meteo     INTEGER,
+            interdiction_pulv    BOOLEAN,
+            pluie_limitante      BOOLEAN,
+            risque_dispersion    BOOLEAN,
+            wind_speed_10m_mean   DOUBLE,
+            precipitation_sum    DOUBLE,
+            risque_brut          DOUBLE,
+            risque_0_4           INTEGER,
+            PRIMARY KEY (insee_com, date)
+        )
+    """)
+    con.execute("""
+        INSERT INTO risque_previsions
+        SELECT insee_com, date, ift_journalier_total, indicateur_meteo,
+               interdiction_pulv, pluie_limitante, risque_dispersion,
+               wind_speed_10m_mean, precipitation_sum, risque_brut, risque_0_4
+        FROM df
+    """)
+    logger.info(
+        f"✓ DuckDB risque_previsions — {df.shape[0]:,} lignes "
+        f"({df['date'].n_unique()} jours × {df['insee_com'].n_unique()} communes)"
+    )
+    con.close()
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--annee", type=int, default=2025)
+    parser.add_argument("--region", type=str, default=None,
+                        help='Filtrer sur une région (ex: "Pays de la Loire")')
+    parser.add_argument("--previsions", action="store_true",
+                        help="Calcule aussi le risque prévisionnel (7 jours)")
+    parser.add_argument("--methode", type=str, default="quartiles", choices=["quartiles", "valeurs"],
+                        help="Méthode de discrétisation du risque (quartiles ou seuils fixes)")
     args = parser.parse_args()
 
-    logger.info(f"Calcul risque journalier {args.annee}...")
-    df = compute_risque_journalier(args.annee)
+    region_label = f" — {args.region}" if args.region else ""
+    logger.info(f"Calcul risque journalier {args.annee}{region_label}...")
+    df = compute_risque_journalier(args.annee, args.region)
 
-    output = PARQUET_DIR / f"risque_journalier_{args.annee}.parquet"
-    df.write_parquet(output)
-    logger.info(f"✓ {output} — {df.shape[0]:,} lignes ({df['date'].n_unique()} jours × {df['insee_com'].n_unique()} communes)")
-    print(df.head(10))
+    write_risque_to_duckdb(df, args.annee, args.region)
+
+    if args.previsions:
+        logger.info(f"Calcul risque prévisionnel{region_label}...")
+        df_prev = compute_risque_previsions(args.annee, args.region)
+        if df_prev is not None:
+            write_previsions_to_duckdb(df_prev)

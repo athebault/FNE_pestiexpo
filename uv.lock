@@ -222,6 +222,20 @@ wheels = [
 ]
 
 [[package]]
+name = "cdsapi"
+version = "0.7.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "ecmwf-datastores-client" },
+    { name = "requests" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/55/f3/6cb5b4bf077c441978c5d5be3a568d37e1f07f3e7177a17fa66aec2594b6/cdsapi-0.7.7.tar.gz", hash = "sha256:bc0cf807c1b78aceba6a11c3a5180f885f47f71a4e58205e324cfedcee16f10b", size = 13322, upload-time = "2025-09-30T19:11:22.404Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4f/f4/4a65460d5cb6784128019fd707a87993f378db25e796eba01400a0903f62/cdsapi-0.7.7-py2.py3-none-any.whl", hash = "sha256:384c1658572d6dc53f4111f6dd46fcdfe6fea54a688af9756d71f6fe9118b66d", size = 12293, upload-time = "2025-09-30T19:11:21.184Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2026.1.4"
 source = { registry = "https://pypi.org/simple" }
@@ -687,6 +701,21 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/76/2a/721b05d551f90ed198aa05c2455fd056f4f1742967cee154347eaada2745/eccodes-2.45.0-cp312-cp312-win_amd64.whl", hash = "sha256:b661ce2d0e73ce0724f137606bf6b579fb2eba4db0f5b466b4345170cb4bf5f2", size = 7406814, upload-time = "2026-01-15T16:26:42.454Z" },
     { url = "https://files.pythonhosted.org/packages/6b/33/3dceb280fbbacb10f8f1e2e1a249a7fd80ce7cc532b69d56c981df21a348/eccodes-2.45.0-cp313-cp313-win_amd64.whl", hash = "sha256:2f07d8892cca722cf67528d3f82d25c851f298cb9b9c6de4c79cb8698857a8ef", size = 7406811, upload-time = "2026-01-15T16:26:39.689Z" },
     { url = "https://files.pythonhosted.org/packages/7f/40/0a42c7441d76c373a7bef7ec1f535f26910a8c82a37e745ffcd3ea0cdf79/eccodes-2.45.0-py3-none-any.whl", hash = "sha256:0ba61dbd2844843f1fd466c8ca24107932cc40088338f6176428cf38c533c08c", size = 91433, upload-time = "2026-01-15T16:27:06.601Z" },
+]
+
+[[package]]
+name = "ecmwf-datastores-client"
+version = "0.5.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+    { name = "multiurl" },
+    { name = "requests" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/42/5e/99ad10e2ea56b48a78f1755cb5af028721240d8cbf354d83d23410e3581f/ecmwf_datastores_client-0.5.1.tar.gz", hash = "sha256:0ebf6304dc267befa506ce805208d5c7a675e1b0dd76da1dad5dc8501d318cc4", size = 48879, upload-time = "2026-03-31T10:48:14.709Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/13/a6/27bc3c51cf862c8b70bc8fe21b812b9c1ca6f31ecee9def96c82d93f003b/ecmwf_datastores_client-0.5.1-py3-none-any.whl", hash = "sha256:3dce212f2da773e22f509c25c7c10144789658107e0a37d09e02cbeffc38ec57", size = 29196, upload-time = "2026-03-31T10:48:13.463Z" },
 ]
 
 [[package]]
@@ -1843,6 +1872,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "beautifulsoup4" },
+    { name = "cdsapi" },
     { name = "duckdb" },
     { name = "eccodes" },
     { name = "fastapi" },
@@ -1877,6 +1907,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.14.3" },
+    { name = "cdsapi", specifier = ">=0.7.7" },
     { name = "duckdb", specifier = ">=1.5.1" },
     { name = "eccodes", specifier = ">=2.45.0" },
     { name = "fastapi", specifier = ">=0.135.2" },
@@ -1906,6 +1937,21 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.42.0" },
     { name = "xarray", specifier = ">=2026.2.0" },
     { name = "xlsxwriter", specifier = ">=3.2.9" },
+]
+
+[[package]]
+name = "multiurl"
+version = "0.3.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "python-dateutil" },
+    { name = "pytz" },
+    { name = "requests" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6c/ce/a00c9b44f43c4620ca004e4acb4c1e266b1ab48d2f6ad9e402f6bdbe44d4/multiurl-0.3.7.tar.gz", hash = "sha256:4201563fc8989baca7b525fdc69d4cd5a6c0cef4f303559710b9890021aab6d9", size = 18945, upload-time = "2025-07-29T11:57:04.109Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/93/cf/be4e93afbfa0def2cd6fac9302071db0bd6d0617999ecbf53f92b9398de3/multiurl-0.3.7-py3-none-any.whl", hash = "sha256:054f42974064f103be0ed55b43f0c32fc435a47dc7353a9adaffa643b99fa380", size = 21524, upload-time = "2025-07-29T11:57:03.191Z" },
 ]
 
 [[package]]

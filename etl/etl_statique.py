@@ -19,20 +19,10 @@ import geopandas as gpd
 import pandas as pd
 from pathlib import Path
 import logging
-from config import PARQUET_DIR, DATA_DIR
+from config import PARQUET_DIR, COMMUNE_GPKG, RPG_GPKG, IFT_CSV, CALENDRIER_XLSX, NOMENCLATURE_XLSX
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-# ============================================================
-# CHEMINS SOURCE 
-# ============================================================
-COMMUNE_GPKG    = DATA_DIR / "raw/ADE_4-0_GPKG_WGS84G_FRA-ED2026-02-16.gpkg"
-IFT_CSV         = DATA_DIR / "raw/fre-324510908-adonis-ift-2022-v04112024.csv"
-CALENDRIER_XLSX = DATA_DIR / "raw/calendrier_culture_harmonise.xlsx"
-NOMENCLATURE_XLSX = DATA_DIR / "raw/RPG_nomenclatures.xlsx"
-RPG_GPKG          = DATA_DIR / "raw/RPG_3-0__GPKG_LAMB93_FXX_2024-01-01/RPG_Parcelles.gpkg"
-
 
 # ============================================================
 # 1a. COMMUNES + CENTROIDES
@@ -123,6 +113,15 @@ def build_ift() -> pl.DataFrame:
     
     ift = ift[cols].copy()
 
+    # Suppression des doublons par commune (le CSV ADONIS peut avoir plusieurs lignes
+    # pour la même commune : cultures ex-æquo au rang 1, ou vraie duplication).
+    # On garde la première occurrence — les valeurs IFT sont identiques entre les doublons.
+    n_avant = len(ift)
+    ift = ift.drop_duplicates(subset=["insee_com"])
+    n_apres = len(ift)
+    if n_avant != n_apres:
+        logger.warning(f"  ⚠ {n_avant - n_apres} doublon(s) supprimé(s) dans le CSV ADONIS ({n_avant} → {n_apres} lignes)")
+
     # Libellés cultures
     nomenclature = pl.read_excel(NOMENCLATURE_XLSX, sheet_name="Annexe_A_cultures")
     code_to_libelle = dict(zip(
@@ -184,7 +183,26 @@ def build_nomenclature() -> dict[str, pl.DataFrame]:
 
 
 # ============================================================
-# 5. SAUVEGARDE EN PARQUET
+# 5. GEOMETRIES SIMPLIFIEES POUR LA CARTE
+# ============================================================
+def build_communes_geo() -> None:
+    """
+    Exporte les contours communaux simplifiés en GeoJSON pour Plotly Choroplethmapbox.
+    Simplification ~100 m (tolerance=0.001°) pour limiter le poids du fichier.
+    """
+    logger.info("Export géométries communes simplifiées...")
+    communes = gpd.read_file(COMMUNE_GPKG, layer="COMMUNE")
+    communes = communes[["code_insee", "geometry"]].copy()
+    communes["geometry"] = communes["geometry"].simplify(tolerance=0.001, preserve_topology=True)
+    communes = communes[communes["geometry"].notna() & ~communes["geometry"].is_empty]
+    out = PARQUET_DIR / "communes_geo.geojson"
+    communes.to_file(out, driver="GeoJSON")
+    size_mo = out.stat().st_size / 1e6
+    logger.info(f"✓ communes_geo.geojson ({size_mo:.1f} Mo, {len(communes)} communes)")
+
+
+# ============================================================
+# 6. SAUVEGARDE EN PARQUET
 # ============================================================
 def save_all(annee: int = 2026, details: bool = False):
     PARQUET_DIR.mkdir(parents=True, exist_ok=True)
@@ -227,6 +245,9 @@ def save_all(annee: int = 2026, details: bool = False):
     for nom, df in nomenclatures.items():
         df.write_parquet(PARQUET_DIR / f"nomenclature_{nom}.parquet")
         logger.info(f"✓ nomenclature_{nom}.parquet")
+
+    # Géométries simplifiées pour la carte choroplèthe
+    build_communes_geo()
 
     logger.info("ETL statique terminé ✓")
 
