@@ -3,17 +3,17 @@ Configuration du dashboard PestiExpo.
 Constantes visuelles, chemins, et libellés.
 """
 
+import os
 import sys
 from pathlib import Path
 
 # ── Chemins ──────────────────────────────────────────────────
-ROOT       = Path(__file__).resolve().parent.parent
-DB_PATH    = ROOT / "data" / "pestiexpo.duckdb"
-PARQUET    = ROOT / "data" / "parquet"
+ROOT         = Path(__file__).resolve().parent.parent
+PARQUET      = ROOT / "data" / "parquet"
 GEOJSON_PATH = PARQUET / "communes_geo.geojson"
 
-# Accès au module ETL (CULTURE_MAPPING, etc.)
-sys.path.insert(0, str(ROOT / "etl"))
+# URL de l'API FastAPI (peut être surchargée par variable d'environnement)
+API_URL = os.getenv("API_URL", "http://localhost:8000")
 
 # ── Palette & états ──────────────────────────────────────────
 #   Différence explicite entre "pas de données calendrier" et "pas de traitement ce jour"

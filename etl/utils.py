@@ -16,7 +16,7 @@ import duckdb
 import time
 import logging
 
-from config import METEO_CHUNK_SIZE, DUCKDB_PATH, PARQUET_DIR, code_region_rpg
+from etl_config import METEO_CHUNK_SIZE, DUCKDB_PATH, PARQUET_DIR, code_region_rpg
 
 logger = logging.getLogger(__name__)
 

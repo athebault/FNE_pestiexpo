@@ -32,7 +32,7 @@ class RisqueJour(BaseModel):
     risque_0_4:           Optional[int]
     ift_journalier_total: Optional[float]
     risque_brut:          Optional[float]
-    facteur_meteo:        Optional[float]
+    indicateur_meteo:     Optional[int]
     interdiction_pulv:    Optional[bool]
     pluie_limitante:      Optional[bool]
     risque_dispersion:    Optional[bool]

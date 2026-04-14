@@ -1,6 +1,7 @@
 """
 Gestion de la connexion DuckDB et chargement des données de référence.
-Toutes les requêtes lisent directement les fichiers parquet via DuckDB.
+- get_con()       : DuckDB in-memory, pour lire les parquets statiques (calendrier, mesures)
+- get_duckdb_con(): Connexion au fichier pestiexpo.duckdb (risque_journalier, risque_previsions)
 """
 import os
 import sys
@@ -11,17 +12,23 @@ import duckdb
 import pandas as pd
 import polars as pl
 
-ROOT      = Path(__file__).resolve().parent.parent
-DATA_DIR  = Path(os.getenv("DATA_DIR", str(ROOT / "data")))
-PARQUET   = DATA_DIR / "parquet"
+ROOT        = Path(__file__).resolve().parent.parent
+DATA_DIR    = Path(os.getenv("DATA_DIR", str(ROOT / "data")))
+PARQUET     = DATA_DIR / "parquet"
+DUCKDB_PATH = DATA_DIR / "pestiexpo.duckdb"
 
 sys.path.insert(0, str(ROOT / "etl"))
 from calcul_risque_journalier import CULTURE_MAPPING
 
 
 def get_con() -> duckdb.DuckDBPyConnection:
-    """Connexion DuckDB in-memory (lecture directe des parquets, sans lock)."""
+    """DuckDB in-memory pour lecture de parquets statiques (calendrier, mesures)."""
     return duckdb.connect(":memory:")
+
+
+def get_duckdb_con() -> duckdb.DuckDBPyConnection:
+    """Connexion au fichier DuckDB de l'ETL (risque_journalier, risque_previsions)."""
+    return duckdb.connect(str(DUCKDB_PATH), read_only=True)
 
 
 @lru_cache(maxsize=1)
@@ -81,8 +88,16 @@ def mesures_path() -> Path:
 
 
 def annees_disponibles() -> list[int]:
-    return sorted(
-        int(f.stem.split("_")[-1])
-        for f in PARQUET.glob("risque_journalier_*.parquet")
-        if f.stem.split("_")[-1].isdigit()
-    )
+    if not DUCKDB_PATH.exists():
+        return []
+    con = get_duckdb_con()
+    try:
+        tables = [t[0] for t in con.execute("SHOW TABLES").fetchall()]
+        if "risque_journalier" not in tables:
+            return []
+        rows = con.execute(
+            "SELECT DISTINCT year(date) FROM risque_journalier ORDER BY 1"
+        ).fetchall()
+        return [r[0] for r in rows]
+    finally:
+        con.close()

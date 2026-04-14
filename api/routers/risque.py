@@ -4,7 +4,7 @@ from typing import Optional
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Query
 
-from api.db import communes_ref, get_con, risque_path, annees_disponibles, PARQUET
+from api.db import communes_ref, get_duckdb_con, annees_disponibles, DUCKDB_PATH
 from api.schemas import CarteDateResponse, RisqueCommuneCarte, RisqueJour, RisqueSerie
 
 router = APIRouter()
@@ -14,10 +14,22 @@ def _safe(val):
     return None if pd.isna(val) else val
 
 
+def _has_risque_table(con, table: str = "risque_journalier") -> bool:
+    tables = [t[0] for t in con.execute("SHOW TABLES").fetchall()]
+    return table in tables
+
+
+# ── Routes statiques en premier (avant /{code_insee}) ────────
+# IMPORTANT : FastAPI matche les routes dans l'ordre de déclaration.
+# Toutes les routes à segment fixe (/annees, /carte/..., /previsions/...)
+# doivent être déclarées AVANT /{code_insee} pour éviter les conflits.
+
 @router.get("/annees", response_model=list[int], summary="Années disponibles")
 def get_annees():
     return annees_disponibles()
 
+
+# ── Carte (historique) ────────────────────────────────────────
 
 @router.get(
     "/carte/{date_str}",
@@ -34,19 +46,19 @@ def carte(
     except ValueError:
         raise HTTPException(400, "Format de date invalide (attendu : YYYY-MM-DD)")
 
-    annee = d.year
-    p = risque_path(annee)
-    if not p.exists():
-        raise HTTPException(404, f"Aucune donnée de risque pour l'année {annee}")
+    if not DUCKDB_PATH.exists():
+        raise HTTPException(503, "Base de données non disponible")
 
-    con = get_con()
+    con = get_duckdb_con()
     try:
-        df_risque = con.execute(f"""
+        if not _has_risque_table(con):
+            raise HTTPException(404, "Aucune donnée de risque disponible")
+        df_risque = con.execute("""
             SELECT insee_com, risque_0_4, ift_journalier_total,
                    interdiction_pulv, pluie_limitante, risque_dispersion
-            FROM read_parquet('{p}')
-            WHERE date = '{d}'
-        """).df()
+            FROM risque_journalier
+            WHERE date = ?
+        """, [d]).df()
     finally:
         con.close()
 
@@ -58,9 +70,8 @@ def carte(
 
     merged = communes.merge(df_risque, left_on="code_insee", right_on="insee_com", how="left")
 
-    result = []
-    for _, r in merged.iterrows():
-        result.append(RisqueCommuneCarte(
+    result = [
+        RisqueCommuneCarte(
             code_insee=r["code_insee"],
             nom_commune=r["nom_commune"],
             latitude=_safe(r.get("latitude")),
@@ -71,10 +82,13 @@ def carte(
             interdiction_pulv=_safe(r.get("interdiction_pulv")),
             pluie_limitante=_safe(r.get("pluie_limitante")),
             risque_dispersion=_safe(r.get("risque_dispersion")),
-        ))
-
+        )
+        for _, r in merged.iterrows()
+    ]
     return CarteDateResponse(date=d, communes=result)
 
+
+# ── Série temporelle commune (historique) ─────────────────────
 
 @router.get(
     "/{code_insee}",
@@ -87,9 +101,8 @@ def serie_commune(
     date_debut: Optional[date] = Query(None),
     date_fin:   Optional[date] = Query(None),
 ):
-    p = risque_path(annee)
-    if not p.exists():
-        raise HTTPException(404, f"Aucune donnée de risque pour l'année {annee}")
+    if not DUCKDB_PATH.exists():
+        raise HTTPException(503, "Base de données non disponible")
 
     communes = communes_ref()
     commune_row = communes[communes["code_insee"] == code_insee]
@@ -97,21 +110,27 @@ def serie_commune(
         raise HTTPException(404, f"Commune {code_insee} introuvable")
     info = commune_row.iloc[0]
 
-    where = f"WHERE insee_com = '{code_insee}'"
-    if date_debut:
-        where += f" AND date >= '{date_debut}'"
-    if date_fin:
-        where += f" AND date <= '{date_fin}'"
-
-    con = get_con()
+    con = get_duckdb_con()
     try:
+        if not _has_risque_table(con):
+            raise HTTPException(404, "Aucune donnée de risque disponible")
+
+        params = [code_insee, annee]
+        where = "WHERE insee_com = ? AND year(date) = ?"
+        if date_debut:
+            where += " AND date >= ?"
+            params.append(date_debut)
+        if date_fin:
+            where += " AND date <= ?"
+            params.append(date_fin)
+
         df = con.execute(f"""
             SELECT date, risque_0_4, ift_journalier_total, risque_brut,
-                   facteur_meteo, interdiction_pulv, pluie_limitante, risque_dispersion
-            FROM read_parquet('{p}')
+                   indicateur_meteo, interdiction_pulv, pluie_limitante, risque_dispersion
+            FROM risque_journalier
             {where}
             ORDER BY date
-        """).df()
+        """, params).df()
     finally:
         con.close()
 
@@ -121,7 +140,7 @@ def serie_commune(
             risque_0_4=int(r["risque_0_4"]) if pd.notna(r.get("risque_0_4")) else None,
             ift_journalier_total=_safe(r.get("ift_journalier_total")),
             risque_brut=_safe(r.get("risque_brut")),
-            facteur_meteo=_safe(r.get("facteur_meteo")),
+            indicateur_meteo=int(r["indicateur_meteo"]) if pd.notna(r.get("indicateur_meteo")) else None,
             interdiction_pulv=_safe(r.get("interdiction_pulv")),
             pluie_limitante=_safe(r.get("pluie_limitante")),
             risque_dispersion=_safe(r.get("risque_dispersion")),
@@ -138,43 +157,137 @@ def serie_commune(
     )
 
 
+# ── Prévisions ────────────────────────────────────────────────
+
 @router.get(
-    "/{code_insee}/{date_str}",
-    response_model=RisqueJour,
-    summary="Risque d'une commune pour un jour donné",
+    "/previsions/dates",
+    response_model=list[date],
+    summary="Dates disponibles dans les prévisions météo",
 )
-def risque_jour(code_insee: str, date_str: str):
+def previsions_dates():
+    if not DUCKDB_PATH.exists():
+        return []
+    con = get_duckdb_con()
+    try:
+        if not _has_risque_table(con, "risque_previsions"):
+            return []
+        rows = con.execute(
+            "SELECT DISTINCT date FROM risque_previsions ORDER BY date"
+        ).fetchall()
+        return [r[0] for r in rows]
+    finally:
+        con.close()
+
+
+@router.get(
+    "/previsions/carte/{date_str}",
+    response_model=CarteDateResponse,
+    summary="Risque prévisionnel de toutes les communes pour une date",
+)
+def previsions_carte(
+    date_str:    str,
+    region:      Optional[str] = Query(None),
+    departement: Optional[str] = Query(None),
+):
     try:
         d = date.fromisoformat(date_str)
     except ValueError:
         raise HTTPException(400, "Format de date invalide (attendu : YYYY-MM-DD)")
 
-    p = risque_path(d.year)
-    if not p.exists():
-        raise HTTPException(404, f"Aucune donnée de risque pour l'année {d.year}")
+    if not DUCKDB_PATH.exists():
+        raise HTTPException(503, "Base de données non disponible")
 
-    con = get_con()
+    con = get_duckdb_con()
     try:
-        df = con.execute(f"""
-            SELECT date, risque_0_4, ift_journalier_total, risque_brut,
-                   facteur_meteo, interdiction_pulv, pluie_limitante, risque_dispersion
-            FROM read_parquet('{p}')
-            WHERE insee_com = '{code_insee}' AND date = '{d}'
-        """).df()
+        if not _has_risque_table(con, "risque_previsions"):
+            raise HTTPException(404, "Aucune prévision disponible")
+        df_risque = con.execute("""
+            SELECT insee_com, risque_0_4, ift_journalier_total,
+                   interdiction_pulv, pluie_limitante, risque_dispersion
+            FROM risque_previsions
+            WHERE date = ?
+        """, [d]).df()
     finally:
         con.close()
 
-    if df.empty:
-        raise HTTPException(404, f"Aucune donnée pour {code_insee} le {d}")
+    if df_risque.empty:
+        raise HTTPException(404, f"Aucune prévision pour le {d}")
 
-    r = df.iloc[0]
-    return RisqueJour(
-        date=d,
-        risque_0_4=int(r["risque_0_4"]) if pd.notna(r.get("risque_0_4")) else None,
-        ift_journalier_total=_safe(r.get("ift_journalier_total")),
-        risque_brut=_safe(r.get("risque_brut")),
-        facteur_meteo=_safe(r.get("facteur_meteo")),
-        interdiction_pulv=_safe(r.get("interdiction_pulv")),
-        pluie_limitante=_safe(r.get("pluie_limitante")),
-        risque_dispersion=_safe(r.get("risque_dispersion")),
+    communes = communes_ref()
+    if region:
+        communes = communes[communes["code_insee_reg"] == region]
+    if departement:
+        communes = communes[communes["code_insee_dep"] == departement]
+
+    merged = communes.merge(df_risque, left_on="code_insee", right_on="insee_com", how="left")
+
+    result = [
+        RisqueCommuneCarte(
+            code_insee=r["code_insee"],
+            nom_commune=r["nom_commune"],
+            latitude=_safe(r.get("latitude")),
+            longitude=_safe(r.get("longitude")),
+            has_calendar_data=bool(r.get("has_calendar_data", False)),
+            risque_0_4=int(r["risque_0_4"]) if pd.notna(r.get("risque_0_4")) else None,
+            ift_journalier_total=_safe(r.get("ift_journalier_total")),
+            interdiction_pulv=_safe(r.get("interdiction_pulv")),
+            pluie_limitante=_safe(r.get("pluie_limitante")),
+            risque_dispersion=_safe(r.get("risque_dispersion")),
+        )
+        for _, r in merged.iterrows()
+    ]
+    return CarteDateResponse(date=d, communes=result)
+
+
+@router.get(
+    "/previsions/{code_insee}",
+    response_model=RisqueSerie,
+    summary="Série prévisionnelle pour une commune",
+)
+def previsions_serie(code_insee: str):
+    if not DUCKDB_PATH.exists():
+        raise HTTPException(503, "Base de données non disponible")
+
+    communes = communes_ref()
+    commune_row = communes[communes["code_insee"] == code_insee]
+    if commune_row.empty:
+        raise HTTPException(404, f"Commune {code_insee} introuvable")
+    info = commune_row.iloc[0]
+
+    con = get_duckdb_con()
+    try:
+        if not _has_risque_table(con, "risque_previsions"):
+            raise HTTPException(404, "Aucune prévision disponible")
+        df = con.execute("""
+            SELECT date, risque_0_4, ift_journalier_total, risque_brut,
+                   indicateur_meteo, interdiction_pulv, pluie_limitante, risque_dispersion
+            FROM risque_previsions
+            WHERE insee_com = ?
+            ORDER BY date
+        """, [code_insee]).df()
+    finally:
+        con.close()
+
+    annee = df["date"].dt.year.iloc[0] if not df.empty else date.today().year
+
+    jours = [
+        RisqueJour(
+            date=r["date"].date() if hasattr(r["date"], "date") else r["date"],
+            risque_0_4=int(r["risque_0_4"]) if pd.notna(r.get("risque_0_4")) else None,
+            ift_journalier_total=_safe(r.get("ift_journalier_total")),
+            risque_brut=_safe(r.get("risque_brut")),
+            indicateur_meteo=int(r["indicateur_meteo"]) if pd.notna(r.get("indicateur_meteo")) else None,
+            interdiction_pulv=_safe(r.get("interdiction_pulv")),
+            pluie_limitante=_safe(r.get("pluie_limitante")),
+            risque_dispersion=_safe(r.get("risque_dispersion")),
+        )
+        for _, r in df.iterrows()
+    ]
+
+    return RisqueSerie(
+        code_insee=code_insee,
+        nom_commune=info["nom_commune"],
+        has_calendar_data=bool(info.get("has_calendar_data", False)),
+        annee=int(annee),
+        jours=jours,
     )

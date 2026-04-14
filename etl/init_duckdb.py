@@ -8,7 +8,7 @@ Lancement: uv run python3 etl/init_duckdb.py
 import re
 import duckdb
 import logging
-from config import DUCKDB_PATH, PARQUET_DIR, METEO_DIR, METEO_ENABLED
+from etl.etl_config import DUCKDB_PATH, PARQUET_DIR, METEO_DIR, METEO_ENABLED
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)

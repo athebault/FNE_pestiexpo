@@ -19,7 +19,7 @@ import geopandas as gpd
 import pandas as pd
 from pathlib import Path
 import logging
-from config import PARQUET_DIR, COMMUNE_GPKG, RPG_GPKG, IFT_CSV, CALENDRIER_XLSX, NOMENCLATURE_XLSX
+from etl_config import PARQUET_DIR, COMMUNE_GPKG, RPG_GPKG, IFT_CSV, CALENDRIER_XLSX, CALENDRIER_IDF_CSV, NOMENCLATURE_XLSX
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -148,7 +148,7 @@ def build_calendrier(annee: int = 2025) -> pl.DataFrame:
     logger.info("Chargement calendrier épandage...")
 
     cal = pl.read_excel(CALENDRIER_XLSX, sheet_name="CVDL + PDL")
-
+    
     # Normaliser les booléens
     cal = cal.with_columns([
         (pl.col("Herbicides").str.to_lowercase()   == "oui").alias("Herbicides"),
@@ -162,9 +162,43 @@ def build_calendrier(annee: int = 2025) -> pl.DataFrame:
           .alias("Debut_de_periode"),
         pl.date(annee, pl.col("Fin de période").dt.month(), pl.col("Fin de période").dt.day())
           .alias("Fin_de_periode"),
-    ])
+    ]).drop(["Début de période", "Fin de période"])
+    
+    # Ajout des données Île-de-France
+    if CALENDRIER_IDF_CSV.exists():
+        logger.info("Chargement calendrier Île-de-France...")
+        MOIS = {
+            "janvier": 1, "février": 2, "mars": 3, "avril": 4,
+            "mai": 5, "juin": 6, "juillet": 7, "août": 8,
+            "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12,
+        }
+        idf = pl.read_csv(CALENDRIER_IDF_CSV, separator=";")
+        idf = idf.with_columns([
+            (pl.col("type").str.contains("Herbicides")).alias("Herbicides"),
+            (pl.col("type").str.contains("Fongicides")).alias("Fongicides"),
+            (pl.col("type").str.contains("Insecticides")).alias("Insecticides"),
+        ])
+        idf = (
+            idf
+            .with_columns(
+                pl.col("periode").str.to_lowercase().replace(MOIS).cast(pl.Int32).alias("_mois")
+            )
+            .with_columns([
+                pl.date(annee, pl.col("_mois"), 1).alias("Debut_de_periode"),
+                pl.date(annee, pl.col("_mois"), 1).dt.month_end().alias("Fin_de_periode"),
+            ])
+            .drop(["periode", "_mois", "type"])
+        )
 
-    logger.info(f"  → {cal.shape[0]} périodes chargées")
+        cal = pl.concat([
+            cal,
+            idf.with_columns(pl.lit(None).cast(pl.String).alias("Commentaires")).select(cal.columns)
+        ])
+        logger.info(f"  → {cal.shape[0]} périodes chargées (dont Île-de-France)")
+    else:
+        logger.warning(f"Calendrier IDF introuvable : {CALENDRIER_IDF_CSV}")
+        logger.info(f"  → {cal.shape[0]} périodes chargées")
+
     return cal
 
 

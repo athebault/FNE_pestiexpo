@@ -11,3 +11,6 @@ wheels/
 
 # Dossiers
 data/
+
+# Fichiers
+.png

@@ -16,7 +16,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pyproj import Transformer
 
-from config import PARQUET_DIR, METEO_DIR, METEO_URL_ARCHIVES, METEO_CHUNK_SIZE, MESURES_PESTICIDES_FILE, METEO_ENABLED
+from etl.etl_config import PARQUET_DIR, METEO_DIR, METEO_URL_ARCHIVES, METEO_CHUNK_SIZE, MESURES_PESTICIDES_FILE, METEO_ENABLED
 from utils import fetch_meteo_chunk
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")

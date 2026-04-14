@@ -30,7 +30,7 @@ import time
 
 from datetime import date, timedelta
 
-from config import (
+from etl_config import (
     METEO_DIR,
     METEO_URL_ARCHIVES, METEO_URL_PREVISIONS,
     DAILY_VARIABLES, DAILY_VARIABLES_LOCAL,

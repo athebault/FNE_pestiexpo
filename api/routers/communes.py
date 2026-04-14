@@ -35,6 +35,12 @@ def _row_to_detail(r) -> CommuneDetail:
     )
 
 
+@router.get("/all", response_model=list[CommuneDetail], summary="Toutes les communes avec détail IFT et calendrier")
+def all_communes():
+    df = communes_ref()
+    return [_row_to_detail(r) for _, r in df.iterrows()]
+
+
 @router.get("", response_model=list[CommuneBase], summary="Liste des communes")
 def list_communes(
     region:      Optional[str] = Query(None, description="Code région (ex: 24)"),

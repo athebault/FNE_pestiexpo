@@ -11,11 +11,16 @@ Logique :
 import polars as pl
 import logging
 from datetime import date, timedelta
-from config import *
+from etl_config import *
 from utils import get_duckdb
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+logger.info("Valeurs seuils météo — Vent max : %d m/s | Dispersion modérée : %d-%d m/s | Pluie : > %.1f mm",
+            VENT_MAX, VENT_DISPERSION_MAX, VENT_DISPERSION_MIN, PLUIE_SEUIL)
+
 
 def normaliser_culture(expr: pl.Expr) -> pl.Expr:
     """Applique CULTURE_MAPPING sur une expression Polars, retourne None si absent."""
@@ -27,7 +32,7 @@ def normaliser_culture(expr: pl.Expr) -> pl.Expr:
 
 
 # ============================================================
-# 1. CHARGEMENT
+# 1. CHARGEMENT depuis la base de données DuckDB
 # ============================================================
 def load_data(annee: int, region: str | None = None) -> tuple:
 
@@ -47,6 +52,7 @@ def load_data(annee: int, region: str | None = None) -> tuple:
         SELECT
             insee_com,
             code_insee_dep,
+            code_insee_reg,
             c_maj,     ift_t_hbc  AS ift_maj_hbc,
             c_ift_hbc, ift_hh_hbc AS ift_hh_hbc,
             c_ift_h,   ift_h      AS ift_h
@@ -126,6 +132,14 @@ def compute_ift_journalier(
         (pl.col("Fin_de_periode")   >= date_cible)
     )
 
+    # Correspondance département → région (déduite des données IFT)
+    dept_to_region = ift.select(["code_insee_dep", "code_insee_reg"]).unique()
+
+    # Calendrier enrichi avec code région (pour le fallback régional)
+    cal_with_region = cal_for_join.join(
+        dept_to_region, left_on="departement_code", right_on="code_insee_dep", how="inner"
+    )
+
     # (col_culture_norm, col_ift, filtre_type, col_nb_periodes, suffixe_résultat)
     configs = [
         ("c_maj_cal",     "ift_maj_hbc", None,                                         "nb_periodes_total",         "maj_hbc"),
@@ -137,8 +151,26 @@ def compute_ift_journalier(
     for col_culture_cal, col_ift, filtre_type, col_nb, suffix in configs:
         cal_active_type = cal_active.filter(filtre_type) if filtre_type is not None else cal_active
 
+        # Fallback régional : nb_periodes moyen des départements de la région
+        cal_region_nb = (
+            cal_with_region.select(["code_insee_reg", "departement_code", "culture", col_nb])
+            .unique(["code_insee_reg", "departement_code", "culture"])
+            .group_by(["code_insee_reg", "culture"])
+            .agg(pl.col(col_nb).mean().alias(f"{col_nb}_reg"))
+        )
+
+        # Fallback régional : période active si elle l'est pour au moins un département de la région
+        cal_active_region = (
+            cal_active_type.select(["departement_code", "culture"])
+            .unique()
+            .join(dept_to_region, left_on="departement_code", right_on="code_insee_dep", how="inner")
+            .select(["code_insee_reg", "culture"])
+            .unique()
+            .with_columns(pl.lit(True).alias("periode_active_reg"))
+        )
+
         joined = (
-            ift.select(["insee_com", "code_insee_dep", col_culture_cal, col_ift])
+            ift.select(["insee_com", "code_insee_dep", "code_insee_reg", col_culture_cal, col_ift])
             .rename({col_culture_cal: "culture", col_ift: "ift_annuel"})
             .join(
                 cal_for_join.select(["departement_code", "culture", col_nb])
@@ -155,16 +187,34 @@ def compute_ift_journalier(
                 right_on=["departement_code", "culture"],
                 how="left"
             )
+            # Fallback sur le calendrier régional si le département est absent
+            .join(cal_region_nb, on=["code_insee_reg", "culture"], how="left")
+            .join(cal_active_region, on=["code_insee_reg", "culture"], how="left")
+            .with_columns([
+                pl.when(pl.col(col_nb).is_not_null())
+                  .then(pl.col(col_nb))
+                  .otherwise(pl.col(f"{col_nb}_reg"))
+                  .alias(col_nb),
+                pl.when(pl.col("periode_active").is_not_null())
+                  .then(pl.col("periode_active"))
+                  .otherwise(pl.col("periode_active_reg"))
+                  .alias("periode_active"),
+            ])
             .with_columns(
-                pl.when(pl.col(col_nb).is_null())
-                  .then(pl.lit(None, dtype=pl.Float64))   # pas de données calendrier → NaN
+                pl.when((pl.col(col_nb).is_null()) & (pl.col("ift_annuel") == 0))
+                    .then(pl.lit(0, dtype=pl.Float64))  # Pas de traitement donc normal de ne pas apparaître dans le calendrier → contribution 0
+                .when((pl.col("ift_annuel").is_null()))
+                    .then(pl.lit(0, dtype=pl.Float64))  # Pas de parcelle agricoles → contribution 0
+                .when((pl.col(col_nb).is_null()) & (pl.col("ift_annuel") != 0))
+                    .then(pl.lit(None, dtype=pl.Float64)) # IFT non nul mais pas de période dans le calendrier → incohérence dans les données source, contribution indéterminée → NaN
                 .when(pl.col("periode_active").is_not_null())
-                  .then(pl.col("ift_annuel") / pl.col(col_nb))  # période active
-                .otherwise(pl.lit(0.0))                  # dans le calendrier, hors période active → 0
+                    .then(pl.col("ift_annuel") / pl.col(col_nb))
+                .otherwise(pl.lit(0.0))
                 .alias(f"ift_j_{suffix}")
             )
             .select(["insee_com", f"ift_j_{suffix}"])
         )
+
         result_dfs.append(joined)
 
     # Jointure côte à côte des 3 contributions
@@ -213,37 +263,39 @@ def compute_indicateur_meteo(meteo_jour: pl.DataFrame) -> pl.DataFrame:
     """
     Indicateur de conditions météo favorables à la dispersion des pesticides.
 
-    0 — Pas de dispersion : pluie (> 0 mm) ou vent ≥ VENT_MAX (19 m/s)
-        La pluie empêche l'épandage et lave les dépôts ; le vent fort interdit la pulvérisation.
-    1 — Conditions calmes, faible risque de dérive
-        vent < VENT_DISPERSION_MIN (5 m/s), pas de pluie
-    2 — Dispersion modérée
-        VENT_DISPERSION_MIN (5) ≤ vent < VENT_DISPERSION_SEUIL2 (11 m/s), pas de pluie
-    3 — Forte dispersion
-        VENT_DISPERSION_SEUIL2 (11) ≤ vent < VENT_MAX (19 m/s), pas de pluie
+    0 - Pas de dispersion : pluie (> 0 mm)
+        La pluie empêche l'épandage et lave les dépôts 
+    0 - Interdiction de pulvérisation : vent ≥ VENT_MAX (19 m/s)
+    0 - Forte dispersion : VENT_DISPERSION_MIN (11) ≤ vent < VENT_MAX (19 m/s)
+        Même sans pluie, le vent fort rend la pulvérisation dangereuse 
+        → l'agriculture ne va pas pulvériser, risque nul
+        → risque nul car traitement fortement déconseillé
+    1 - Dispersion modérée : VENT_DISPERSION_MAX (5) ≤ vent < VENT_DISPERSION_MIN (11 m/s)
+    2 - Conditions calmes, faible risque de dérive : vent < VENT_DISPERSION_MAX (5 m/s)
+        → plus haut risque d'exposition pour les habitants à proximité
+
     """
-    pluie = pl.col("precipitation_sum") > PLUIE_SEUIL   # > 0 mm
+    pluie = pl.col("precipitation_sum") > PLUIE_SEUIL   
     vent  = pl.col("wind_speed_10m_mean")
 
     return meteo_jour.with_columns([
-        pl.when(pluie | (vent >= VENT_MAX))
+        pl.when(pluie | (vent >= VENT_DISPERSION_MIN))
           .then(pl.lit(0))
-        .when(vent >= VENT_DISPERSION_SEUIL2)
-          .then(pl.lit(3))
-        .when(vent >= VENT_DISPERSION_MIN)
+        .when(vent <= VENT_DISPERSION_MAX)
           .then(pl.lit(2))
         .otherwise(pl.lit(1))
         .cast(pl.Int32)
         .alias("indicateur_meteo"),
 
         (vent >= VENT_MAX).alias("interdiction_pulv"),
+        (vent >= VENT_DISPERSION_MIN).alias("traitement_deconseille"),
         (pl.col("precipitation_sum") > PLUIE_SEUIL).alias("pluie_limitante"),
-        (vent >= VENT_DISPERSION_MIN).alias("risque_dispersion"),
+        (vent < VENT_DISPERSION_MIN).alias("risque_dispersion"),
     ])
 
 
 # ============================================================
-# 4. NORMALISATION 0-4 PAR QUARTILES
+# 4. NORMALISATION 0-4 PAR valeurs seuils
 # ============================================================
 def normalize_0_4(df: pl.DataFrame, col: str = "risque_brut") -> pl.DataFrame:
     """
@@ -255,33 +307,29 @@ def normalize_0_4(df: pl.DataFrame, col: str = "risque_brut") -> pl.DataFrame:
     3   = risque élevé    (Q3)
     4   = risque très élevé (au-delà de Q3)
     """
-    # Calcul des quartiles sur les valeurs strictement positives
-    valeurs_positives = df.filter(pl.col(col) > 0)[col]
-    if valeurs_positives.is_empty():
-        logger.info("Aucune valeur de risque brut > 0, normalisation en 0 partout")
-        return df.with_columns(pl.lit(0).alias("risque_0_4"))
-    if METHODE_SEUIL == "quartiles":
-        q1 = valeurs_positives.quantile(0.25)
-        q2 = valeurs_positives.quantile(0.50)
-        q3 = valeurs_positives.quantile(0.75)
-        logger.info(f"Quartiles risque brut — Q1: {q1:.4f} | Q2: {q2:.4f} | Q3: {q3:.4f}")
-    else:
-        q1, q2, q3 = VALEURS_SEUIL  # Seuils fixes pour les niveaux de risque
-        logger.info(f"Valeurs seuils risque brut — 1: {q1:.4f} | 2: {q2:.4f} | 3: {q3:.4f}")
+    # Obtention des valeurs seuils
+    q1, q2, q3 = VALEURS_SEUIL  # Seuils fixes pour les niveaux de risque
+    logger.info(f"Valeurs seuils risque brut — 1: {q1:.4f} | 2: {q2:.4f} | 3: {q3:.4f}")
     
-
-    return df.with_columns(
-        pl.when(pl.col(col) == 0)
-          .then(0)
-        .when(pl.col(col) <= q1)
-          .then(1)
-        .when(pl.col(col) <= q2)
-          .then(2)
-        .when(pl.col(col) <= q3)
-          .then(3)
-        .otherwise(4)
-        .alias("risque_0_4")
-    )
+    # Verification que df n'est pas vide
+    if df.is_empty():
+        logger.warning("DataFrame vide : aucune donnée pour normalisation. Ajout de la colonne risque_0_4 avec des valeurs nulles.")
+        return df.with_columns(pl.lit(None).cast(pl.Int32).alias("risque_0_4")) 
+    else:
+        return df.with_columns(
+            pl.when(pl.col(col).is_null())
+            .then(pl.lit(None))
+            .when(pl.col(col) == 0)
+            .then(0)
+            .when(pl.col(col) <= q1)
+            .then(1)
+            .when(pl.col(col) <= q2)
+            .then(2)
+            .when(pl.col(col) <= q3)
+            .then(3)
+            .otherwise(4)
+            .alias("risque_0_4")
+        )
 
 
 # ============================================================
@@ -314,8 +362,9 @@ def compute_risque_journalier(annee: int, region: str | None = None) -> pl.DataF
                 .with_columns([
                     pl.lit(1).cast(pl.Int32).alias("indicateur_meteo"),
                     pl.lit(False).alias("interdiction_pulv"),
+                    pl.lit(False).alias("traitement_deconseille"),
                     pl.lit(False).alias("pluie_limitante"),
-                    pl.lit(False).alias("risque_dispersion"),
+                    pl.lit(True).alias("risque_dispersion"),
                     pl.lit(None).cast(pl.Float64).alias("wind_speed_10m_mean"),
                     pl.lit(None).cast(pl.Float64).alias("precipitation_sum"),
                 ])
@@ -325,7 +374,7 @@ def compute_risque_journalier(annee: int, region: str | None = None) -> pl.DataF
             ift_jour.join(
                 meteo_jour.select([
                     "code_insee", "indicateur_meteo",
-                    "interdiction_pulv", "pluie_limitante",
+                    "interdiction_pulv", "traitement_deconseille", "pluie_limitante",
                     "risque_dispersion", "wind_speed_10m_mean", "precipitation_sum"
                 ]),
                 left_on="insee_com",
@@ -382,7 +431,7 @@ def compute_risque_previsions(annee: int, region: str | None = None) -> pl.DataF
             ift_jour.join(
                 meteo_jour.select([
                     "code_insee", "indicateur_meteo",
-                    "interdiction_pulv", "pluie_limitante",
+                    "interdiction_pulv", "traitement_deconseille", "pluie_limitante",
                     "risque_dispersion", "wind_speed_10m_mean", "precipitation_sum"
                 ]),
                 left_on="insee_com", right_on="code_insee", how="left"
@@ -396,32 +445,17 @@ def compute_risque_previsions(annee: int, region: str | None = None) -> pl.DataF
 
     df_prev = pl.concat(resultats)
 
-    # Normalisation avec les quartiles de l'année historique pour garder la même échelle
-    hist_path = PARQUET_DIR / f"risque_journalier_{annee}.parquet"
-    if hist_path.exists():
-        hist = pl.read_parquet(hist_path)
-        vals_pos = hist.filter(pl.col("risque_brut") > 0)["risque_brut"]
-        if not vals_pos.is_empty():
-            if METHODE_SEUIL == "quartiles":
-                q1 = vals_pos.quantile(0.25)
-                q2 = vals_pos.quantile(0.50)
-                q3 = vals_pos.quantile(0.75)
-            else:
-                q1, q2, q3 = VALEURS_SEUIL
-            df_prev = df_prev.with_columns(
-                pl.when(pl.col("risque_brut").is_null()).then(pl.lit(None, dtype=pl.Int32))
-                .when(pl.col("risque_brut") == 0).then(pl.lit(0, dtype=pl.Int32))
-                .when(pl.col("risque_brut") <= q1).then(pl.lit(1, dtype=pl.Int32))
-                .when(pl.col("risque_brut") <= q2).then(pl.lit(2, dtype=pl.Int32))
-                .when(pl.col("risque_brut") <= q3).then(pl.lit(3, dtype=pl.Int32))
-                .otherwise(pl.lit(4, dtype=pl.Int32))
-                .alias("risque_0_4")
-            )
-        else:
-            df_prev = df_prev.with_columns(pl.lit(None, dtype=pl.Int32).alias("risque_0_4"))
-    else:
-        logger.warning("Risque historique non trouvé — normalisation relative aux prévisions seules")
-        df_prev = normalize_0_4(df_prev, col="risque_brut")
+    # Normalisation 
+    q1, q2, q3 = VALEURS_SEUIL
+    df_prev = df_prev.with_columns(
+        pl.when(pl.col("risque_brut").is_null()).then(pl.lit(None, dtype=pl.Int32))
+        .when(pl.col("risque_brut") == 0).then(pl.lit(0, dtype=pl.Int32))
+        .when(pl.col("risque_brut") <= q1).then(pl.lit(1, dtype=pl.Int32))
+        .when(pl.col("risque_brut") <= q2).then(pl.lit(2, dtype=pl.Int32))
+        .when(pl.col("risque_brut") <= q3).then(pl.lit(3, dtype=pl.Int32))
+        .otherwise(pl.lit(4, dtype=pl.Int32))
+        .alias("risque_0_4")
+    )
 
     return df_prev.sort(["insee_com", "date"])
 
@@ -443,6 +477,7 @@ def write_risque_to_duckdb(df: pl.DataFrame, annee: int, region: str | None = No
             ift_journalier_total DOUBLE,
             indicateur_meteo     INTEGER,
             interdiction_pulv    BOOLEAN,
+            traitement_deconseille BOOLEAN,
             pluie_limitante      BOOLEAN,
             risque_dispersion    BOOLEAN,
             wind_speed_10m_mean   DOUBLE,
@@ -461,7 +496,7 @@ def write_risque_to_duckdb(df: pl.DataFrame, annee: int, region: str | None = No
     con.execute("""
         INSERT INTO risque_journalier
         SELECT insee_com, date, ift_journalier_total, indicateur_meteo,
-               interdiction_pulv, pluie_limitante, risque_dispersion,
+               interdiction_pulv, traitement_deconseille, pluie_limitante, risque_dispersion,
                wind_speed_10m_mean, precipitation_sum, risque_brut, risque_0_4
         FROM df
     """)
@@ -488,6 +523,7 @@ def write_previsions_to_duckdb(df: pl.DataFrame):
             ift_journalier_total DOUBLE,
             indicateur_meteo     INTEGER,
             interdiction_pulv    BOOLEAN,
+            traitement_deconseille BOOLEAN,
             pluie_limitante      BOOLEAN,
             risque_dispersion    BOOLEAN,
             wind_speed_10m_mean   DOUBLE,
@@ -500,7 +536,7 @@ def write_previsions_to_duckdb(df: pl.DataFrame):
     con.execute("""
         INSERT INTO risque_previsions
         SELECT insee_com, date, ift_journalier_total, indicateur_meteo,
-               interdiction_pulv, pluie_limitante, risque_dispersion,
+               interdiction_pulv, traitement_deconseille, pluie_limitante, risque_dispersion,
                wind_speed_10m_mean, precipitation_sum, risque_brut, risque_0_4
         FROM df
     """)

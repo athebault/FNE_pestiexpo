@@ -1,128 +1,130 @@
 """
 Fonctions utilitaires du dashboard PestiExpo.
-Chargement des données (DuckDB), préparation des données pour les graphiques,
-et construction des figures Plotly.
+Toutes les données sont récupérées via l'API FastAPI.
 """
 
 import json
-import sys
-import duckdb
+import gzip
+import requests
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import folium
+from folium import plugins
 
 from datetime import date as date_type
 from pathlib import Path
 
-# config_app ajoute etl/ au sys.path — doit être importé avant calcul_risque_journalier
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "etl"))
-from config_app import DB_PATH, GEOJSON_PATH, STATES, STATE_ORDER, REG_NOMS
-from calcul_risque_journalier import CULTURE_MAPPING
+from config_app import API_URL, GEOJSON_PATH, STATES, STATE_ORDER, REG_NOMS
 
 
 # ============================================================
-# Chargement des données (DuckDB)
+# Appels API
 # ============================================================
 
-def _con() -> duckdb.DuckDBPyConnection:
-    """Connexion DuckDB en lecture seule."""
-    return duckdb.connect(str(DB_PATH), read_only=True)
+def _api_get(path: str, params: dict | None = None):
+    """Effectue un GET sur l'API. Lève une exception si l'API est injoignable."""
+    try:
+        r = requests.get(f"{API_URL}{path}", params=params, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except requests.ConnectionError:
+        st.error(f"Impossible de joindre l'API ({API_URL}). Vérifiez qu'elle est démarrée.")
+        st.stop()
 
+
+# ============================================================
+# Chargement des données
+# ============================================================
 
 @st.cache_data(show_spinner="Chargement des communes…")
 def load_communes() -> pd.DataFrame:
-    """Charge communes + IFT + flag calendrier depuis DuckDB."""
-    con = _con()
-
-    df = con.execute("""
-        SELECT
-            c.code_insee, c.nom_commune, c.code_insee_dep, c.code_insee_reg,
-            c.longitude, c.latitude,
-            i.c_maj, i.c_ift_hbc, i.c_ift_h,
-            i.code_insee_dep AS dep_ift
-        FROM communes c
-        LEFT JOIN ift_communes_enrichi i ON c.code_insee = i.insee_com
-    """).df()
-
-    cal_pairs = set(
-        con.execute("SELECT CAST(departement_code AS VARCHAR), culture FROM calendrier_epandage")
-        .fetchall()
-    )
-    con.close()
-
-    old, new = list(CULTURE_MAPPING.keys()), list(CULTURE_MAPPING.values())
-    mapping = dict(zip(old, new))
-
-    df["c_maj_cal"]     = df["c_maj"].map(mapping)
-    df["c_ift_hbc_cal"] = df["c_ift_hbc"].map(mapping)
-    df["c_ift_h_cal"]   = df["c_ift_h"].map(mapping)
-
-    def _has_cal(row):
-        dep = str(row.get("code_insee_dep") or "")
-        for col in ("c_maj_cal", "c_ift_hbc_cal", "c_ift_h_cal"):
-            val = row.get(col)
-            if pd.notna(val) and (dep, val) in cal_pairs:
-                return True
-        return False
-
-    df["has_calendar_data"] = df.apply(_has_cal, axis=1)
-    df["nom_region"]        = df["code_insee_reg"].map(REG_NOMS).fillna("Autre")
+    data = _api_get("/communes/all")
+    df = pd.DataFrame(data)
+    df["nom_region"] = df["code_insee_reg"].map(REG_NOMS).fillna("Autre")
     return df
 
 
 @st.cache_data(show_spinner="Chargement des géométries…")
 def load_geojson() -> dict | None:
-    if not GEOJSON_PATH.exists():
+    geojson_gz = Path(str(GEOJSON_PATH) + ".gz")
+    if not geojson_gz.exists():
         return None
-    with open(GEOJSON_PATH) as f:
+    
+    with gzip.open(geojson_gz, 'rt', encoding='utf-8') as f:
         return json.load(f)
 
 
-@st.cache_data(show_spinner="Chargement des indicateurs de risque…")
-def load_risque(annee: int) -> pd.DataFrame | None:
-    con = _con()
-    tables = [t[0] for t in con.execute("SHOW TABLES").fetchall()]
-    if "risque_journalier" not in tables:
-        con.close()
-        return None
-    df = con.execute(
-        "SELECT * FROM risque_journalier WHERE year(date) = ?", [annee]
-    ).df()
-    con.close()
+def annees_disponibles() -> list[int]:
+    return _api_get("/risque/annees") or []
+
+
+@st.cache_data(show_spinner="Chargement de la carte…")
+def load_risque_carte(date_sel: date_type) -> pd.DataFrame | None:
+    """Risque de toutes les communes pour une date (historique)."""
+    try:
+        data = _api_get(f"/risque/carte/{date_sel}")
+    except requests.HTTPError as e:
+        if e.response.status_code == 404:
+            return None
+        raise
+    df = pd.DataFrame(data["communes"])
     if df.empty:
         return None
-    df["date"]        = pd.to_datetime(df["date"])
+    df["date"] = pd.to_datetime(data["date"])
     df["is_forecast"] = False
     return df
 
 
 @st.cache_data(show_spinner="Chargement des prévisions…")
-def load_risque_previsions() -> pd.DataFrame | None:
-    con = _con()
-    tables = [t[0] for t in con.execute("SHOW TABLES").fetchall()]
-    if "risque_previsions" not in tables:
-        con.close()
-        return None
-    df = con.execute("SELECT * FROM risque_previsions").df()
-    con.close()
+def load_previsions_dates() -> list[date_type]:
+    dates = _api_get("/risque/previsions/dates") or []
+    return [date_type.fromisoformat(d) for d in dates]
+
+
+@st.cache_data(show_spinner="Chargement de la carte prévisionnelle…")
+def load_previsions_carte(date_sel: date_type) -> pd.DataFrame | None:
+    """Risque prévisionnel de toutes les communes pour une date."""
+    try:
+        data = _api_get(f"/risque/previsions/carte/{date_sel}")
+    except requests.HTTPError as e:
+        if e.response.status_code == 404:
+            return None
+        raise
+    df = pd.DataFrame(data["communes"])
     if df.empty:
         return None
-    df["date"]        = pd.to_datetime(df["date"])
+    df["date"] = pd.to_datetime(data["date"])
     df["is_forecast"] = True
     return df
 
 
-def annees_disponibles() -> list[int]:
-    con = _con()
-    tables = [t[0] for t in con.execute("SHOW TABLES").fetchall()]
-    if "risque_journalier" not in tables:
-        con.close()
-        return []
-    rows = con.execute(
-        "SELECT DISTINCT year(date) AS annee FROM risque_journalier ORDER BY annee"
-    ).fetchall()
-    con.close()
-    return [r[0] for r in rows]
+@st.cache_data(show_spinner="Chargement de la série temporelle…")
+def load_risque_serie(code_insee: str, annee: int) -> pd.DataFrame:
+    """Série temporelle historique pour une commune."""
+    try:
+        data = _api_get(f"/risque/{code_insee}", params={"annee": annee})
+    except requests.HTTPError:
+        return pd.DataFrame()
+    df = pd.DataFrame(data.get("jours", []))
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+        df["is_forecast"] = False
+    return df
+
+
+@st.cache_data(show_spinner="Chargement des prévisions commune…")
+def load_previsions_serie(code_insee: str) -> pd.DataFrame:
+    """Série prévisionnelle pour une commune."""
+    try:
+        data = _api_get(f"/risque/previsions/{code_insee}")
+    except requests.HTTPError:
+        return pd.DataFrame()
+    df = pd.DataFrame(data.get("jours", []))
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+        df["is_forecast"] = True
+    return df
 
 
 # ============================================================
@@ -130,7 +132,6 @@ def annees_disponibles() -> list[int]:
 # ============================================================
 
 def get_state(risque_0_4, ift_total, has_cal: bool) -> str | int:
-    """Détermine l'état d'affichage d'une commune pour un jour donné."""
     if not has_cal:
         return "no_calendar"
     if pd.isna(risque_0_4):
@@ -144,12 +145,12 @@ def get_state(risque_0_4, ift_total, has_cal: bool) -> str | int:
 
 def build_map_data(
     view: pd.DataFrame,
-    risque: pd.DataFrame | None,
-    previsions: pd.DataFrame | None,
     date_sel: date_type | None,
+    dates_prev: set[date_type],
 ) -> tuple[pd.DataFrame, bool]:
     """
-    Fusionne les données de risque avec les communes pour la date sélectionnée.
+    Récupère les données de risque pour la date sélectionnée via l'API
+    et les fusionne avec les communes affichées.
     Retourne (map_data, is_forecast_date).
     """
     map_data         = view.copy()
@@ -158,25 +159,21 @@ def build_map_data(
     risk_cols = ["risque_0_4", "ift_journalier_total", "interdiction_pulv",
                  "pluie_limitante", "risque_dispersion"]
 
+    rj = None
     if date_sel is not None:
-        rj = None
-        if previsions is not None:
-            rj_prev = previsions[previsions["date"].dt.date == date_sel]
-            if not rj_prev.empty:
-                rj, is_forecast_date = rj_prev, True
-        if rj is None and risque is not None:
-            rj_hist = risque[risque["date"].dt.date == date_sel]
-            if not rj_hist.empty:
-                rj = rj_hist
+        if date_sel in dates_prev:
+            rj = load_previsions_carte(date_sel)
+            if rj is not None:
+                is_forecast_date = True
+        if rj is None:
+            rj = load_risque_carte(date_sel)
 
-        if rj is not None:
-            map_data = map_data.merge(
-                rj[["insee_com"] + risk_cols],
-                left_on="code_insee", right_on="insee_com", how="left",
-            )
-        else:
-            for col in risk_cols:
-                map_data[col] = float("nan")
+    if rj is not None and not rj.empty:
+        map_data = map_data.merge(
+            rj[["code_insee"] + risk_cols],
+            on="code_insee",
+            how="left",
+        )
     else:
         for col in risk_cols:
             map_data[col] = float("nan")
@@ -198,11 +195,65 @@ def build_map_data(
     )
     return map_data, is_forecast_date
 
+# ============================================================
+# Affichage carte 
+# ============================================================
+def _style_function(feature, color_map):
+    """Applique le style (couleur) à une feature GeoJSON."""
+    insee = feature['properties'].get('code_insee')
+    color = color_map.get(insee, '#cccccc')  # Gris par défaut
+    return {
+        'fillColor': color,
+        'color': '#333',
+        'weight': 1,
+        'opacity': 0.8,
+        'fillOpacity': 0.7,
+    }
+
+
+def _get_popup(feature, map_data):
+    """Génère le texte du popup pour une feature."""
+    insee = feature['properties'].get('code_insee')
+    row = map_data[map_data['code_insee'] == insee]
+    if row.empty:
+        return "—"
+    r = row.iloc[0]
+    return f"{r['nom_commune']} ({insee})<br>État : {r['label']}"
+
+
+def make_map_folium(map_data: pd.DataFrame, geojson: dict | None, zoom: int = 6) -> folium.Map:
+    """Crée une carte Folium avec les communes coloriées (polygones)."""
+    
+    center_lat = map_data["latitude"].mean()
+    center_lon = map_data["longitude"].mean()
+    
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=zoom,
+        tiles="OpenStreetMap",
+    )
+    
+    if geojson is None:
+        return m
+    
+    # Créer un dictionnaire code_insee → couleur
+    color_map = dict(zip(map_data["code_insee"], map_data["color"]))
+    
+    # Ajouter les géométries coloriées
+    for feature in geojson.get('features', []):
+        folium.GeoJson(
+            feature,
+            style_function=lambda f, cm=color_map: _style_function(f, cm),
+            popup=folium.Popup(_get_popup(feature, map_data), max_width=300),
+            tooltip=feature['properties'].get('code_insee', ''),
+        ).add_to(m)
+    
+    return m
 
 # ============================================================
-# Figures Plotly
+# Figures 
 # ============================================================
-
+@st.cache_data(show_spinner="Chargement de la carte…")
 def make_fig_map(
     map_data: pd.DataFrame,
     geojson: dict | None,
@@ -222,57 +273,67 @@ def make_fig_map(
 
     map_data["state_int"] = map_data["state"].map(state_to_int).fillna(1)
 
-    if geojson:
-        fig.add_trace(go.Choroplethmap(
+    if geojson is not None:
+        # Utiliser Choroplethmapbox pour afficher les géométries coloriées
+        insee_to_state = dict(zip(map_data['code_insee'], map_data['state_int']))
+        insee_to_hover = dict(zip(map_data['code_insee'], map_data['hover']))
+        
+        locations = [f['properties']['code_insee'] for f in geojson['features']]
+        z = [insee_to_state.get(loc, 1) for loc in locations]
+        hovertext = [insee_to_hover.get(loc, loc) for loc in locations]
+        
+        fig.add_trace(go.Choroplethmapbox(
             geojson=geojson,
-            locations=map_data["code_insee"],
+            locations=locations,
+            z=z,
+            colorscale=colorscale,
+            zmin=0,
+            zmax=n-1,
+            marker_opacity=0.7,
+            marker_line_width=0.5,
+            hovertext=hovertext,
+            hovertemplate="%{hovertext}<extra></extra>",
             featureidkey="properties.code_insee",
-            z=map_data["state_int"],
-            colorscale=colorscale, zmin=0, zmax=n - 1,
             showscale=False,
-            marker_opacity=0.8, marker_line_width=0.3,
-            marker_line_color="rgba(255,255,255,0.4)",
-            text=map_data["hover"], hoverinfo="text", showlegend=False,
         ))
-        if commune_sel:
-            sel = map_data[map_data["code_insee"] == commune_sel]
-            if not sel.empty:
-                fig.add_trace(go.Choroplethmap(
-                    geojson=geojson,
-                    locations=sel["code_insee"],
-                    featureidkey="properties.code_insee",
-                    z=sel["state_int"],
-                    colorscale=colorscale, zmin=0, zmax=n - 1,
-                    showscale=False, showlegend=False,
-                    marker_opacity=1.0, marker_line_width=3,
-                    marker_line_color="white",
-                    text=sel["hover"], hoverinfo="text",
-                ))
-        for s in STATE_ORDER:
-            clr, lbl = STATES[s]
-            fig.add_trace(go.Scattermap(
-                lat=[None], lon=[None], mode="markers",
-                marker=dict(size=10, color=clr),
-                name=lbl, showlegend=True,
-            ))
     else:
-        for s, (clr, lbl) in STATES.items():
-            sub = map_data[map_data["state"] == s]
-            if sub.empty:
-                continue
-            fig.add_trace(go.Scattermap(
-                lat=sub["latitude"], lon=sub["longitude"], mode="markers",
-                marker=dict(size=5, color=clr, opacity=0.85),
-                text=sub["hover"], hoverinfo="text", name=lbl,
-            ))
+        # Fallback to scatter markers if no GeoJSON
+        fig.add_trace(go.Scattermapbox(
+            lat=map_data["latitude"],
+            lon=map_data["longitude"],
+            mode="markers",
+            marker=dict(
+                size=12,
+                color=map_data["state_int"],
+                colorscale=colorscale,
+                cmin=0,
+                cmax=n-1,
+                showscale=False,
+            ),
+            text=map_data["hover"],
+            hoverinfo="text",
+            showlegend=False,
+        ))
+
+    # Ajouter la légende
+    for s in STATE_ORDER:
+        clr, lbl = STATES[s]
+        fig.add_trace(go.Scattermapbox(
+            lat=[None], lon=[None], mode="markers",
+            marker=dict(size=10, color=clr),
+            name=lbl, showlegend=True,
+        ))
 
     center_lat = map_data["latitude"].mean() if not map_data.empty else 46.5
     center_lon = map_data["longitude"].mean() if not map_data.empty else 2.3
     zoom = 8 if dep_sel else (6 if reg_sel else 5)
 
     fig.update_layout(
-        map_style="carto-positron",
-        map=dict(center=dict(lat=center_lat, lon=center_lon), zoom=zoom),
+        mapbox=dict(
+            style="carto-positron",
+            center=dict(lat=center_lat, lon=center_lon),
+            zoom=zoom,
+        ),
         height=600,
         margin=dict(l=0, r=0, t=0, b=0),
         legend=dict(
@@ -326,12 +387,16 @@ def make_fig_ts(ts: pd.DataFrame) -> go.Figure:
             name="Prévision ⚡", showlegend=True,
         ))
 
-    fig.add_vline(
-        x=str(date_type.today()), line_width=1.5,
-        line_dash="dash", line_color="grey",
-        annotation_text="Auj.", annotation_position="top right",
-        annotation_font_size=10,
-    )
+    # Convert timestamp to numeric value for add_vline (avoids Plotly timestamp arithmetic bug)
+    if not ts.empty and pd.notna(ts["date"].iloc[0]):
+        vline_value = pd.Timestamp(ts["date"].iloc[0]).value  # Convert to nanoseconds
+        fig.add_vline(
+            x=vline_value, line_width=1.5,
+            line_dash="dash", line_color="grey",
+            annotation_text="Auj.", annotation_position="top right",
+            annotation_font_size=10,
+        )
+    
     fig.update_layout(
         title="Évolution du risque",
         yaxis=dict(range=[0, 4.3], tickvals=[0, 1, 2, 3, 4]),
