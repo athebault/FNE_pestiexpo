@@ -13,4 +13,7 @@ wheels/
 data/
 
 # Fichiers
-.png
+.pngnotebooks/carte_risque_date.ipynb
+notebooks/outputs/ >> .gitignore
+
+echo notebooks/outputs/*
